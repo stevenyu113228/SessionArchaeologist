@@ -115,7 +115,6 @@ def refine_narrative(
     session_id: str, revision: int, req: RefineRequest, db: DBSession = Depends(get_db)
 ):
     from archaeologist.config import settings
-    from archaeologist.db.models import Chunk, Session, Turn
     from archaeologist.refiner.agent import refine_narrative as do_refine
 
     session = _find_session(db, session_id)
@@ -130,21 +129,11 @@ def refine_narrative(
         for a in req.annotations
     ]
 
-    chunks = db.query(Chunk).filter(Chunk.session_id == session.id).order_by(Chunk.chunk_index).all()
-    turns_by_chunk = {}
-    for c in chunks:
-        turns_by_chunk[c.chunk_index] = (
-            db.query(Turn)
-            .filter(Turn.session_id == session.id, Turn.turn_index >= c.start_turn, Turn.turn_index <= c.end_turn)
-            .order_by(Turn.turn_index)
-            .all()
-        )
-
     new_md = do_refine(
         current_narrative=narr.content_md,
         annotations=annotations,
-        chunks=chunks,
-        turns_by_chunk=turns_by_chunk,
+        session_id=str(session.id),
+        manifest=session.manifest,
         model=settings.refinement_model,
     )
 
@@ -242,3 +231,124 @@ def diff_narratives(session_id: str, rev1: int, rev2: int, db: DBSession = Depen
         tofile=f"rev {rev2}",
     ))
     return {"diff": "".join(diff), "rev1": rev1, "rev2": rev2}
+
+
+class SectionRequest(BaseModel):
+    section_path: str
+
+
+@router.post("/{session_id}/narratives/{revision}/expand-section")
+def expand_section_endpoint(
+    session_id: str, revision: int, req: SectionRequest, db: DBSession = Depends(get_db)
+):
+    """Expand a section using agent loop with RAG search for evidence."""
+    from archaeologist.config import settings
+    from archaeologist.refiner.agent import expand_section
+
+    session = _find_session(db, session_id)
+    narr = db.query(Narrative).filter(
+        Narrative.session_id == session.id, Narrative.revision == revision
+    ).first()
+    if not narr:
+        raise HTTPException(404, f"Revision {revision} not found")
+
+    new_md = expand_section(
+        narrative=narr.content_md,
+        section_path=req.section_path,
+        session_id=str(session.id),
+        manifest=session.manifest,
+        model=settings.refinement_model,
+    )
+
+    return _save_new_revision(db, session, narr, new_md, "expand")
+
+
+@router.post("/{session_id}/narratives/{revision}/shrink-section")
+def shrink_section_endpoint(
+    session_id: str, revision: int, req: SectionRequest, db: DBSession = Depends(get_db)
+):
+    """Shrink a section (one-shot, no RAG needed)."""
+    from archaeologist.config import settings
+    from archaeologist.refiner.agent import shrink_section
+
+    session = _find_session(db, session_id)
+    narr = db.query(Narrative).filter(
+        Narrative.session_id == session.id, Narrative.revision == revision
+    ).first()
+    if not narr:
+        raise HTTPException(404, f"Revision {revision} not found")
+
+    new_md = shrink_section(
+        narrative=narr.content_md,
+        section_path=req.section_path,
+        model=settings.refinement_model,
+    )
+
+    return _save_new_revision(db, session, narr, new_md, "shrink")
+
+
+class TranslateRequest(BaseModel):
+    target_lang: str = "zh-TW"
+
+
+@router.post("/{session_id}/narratives/{revision}/translate")
+def translate_narrative(
+    session_id: str, revision: int, req: TranslateRequest, db: DBSession = Depends(get_db)
+):
+    """Translate narrative to target language using Sonnet (section by section)."""
+    import re
+    from archaeologist.config import settings
+    from archaeologist.llm.client import chat_completion
+
+    session = _find_session(db, session_id)
+    narr = db.query(Narrative).filter(
+        Narrative.session_id == session.id, Narrative.revision == revision
+    ).first()
+    if not narr:
+        raise HTTPException(404, f"Revision {revision} not found")
+
+    lang_names = {"zh-TW": "繁體中文", "en": "English", "ja": "日本語", "ko": "한국어"}
+    lang_name = lang_names.get(req.target_lang, req.target_lang)
+
+    # Split by ## headings for section-by-section translation
+    sections = re.split(r"(?=^## )", narr.content_md, flags=re.MULTILINE)
+    translated_parts = []
+
+    system = (
+        f"You are a professional translator. Translate the following markdown content to {lang_name}. "
+        "Preserve all markdown formatting, code blocks, and technical terms. "
+        "Translate prose naturally but keep variable names, function names, CLI commands, "
+        "error messages, file paths, and code snippets in their original form."
+    )
+
+    for section in sections:
+        if not section.strip():
+            continue
+        result = chat_completion(
+            messages=[{"role": "user", "content": section}],
+            model=settings.extraction_model,  # Sonnet for cost efficiency
+            system=system,
+            max_tokens=8192,
+            temperature=0.2,
+        )
+        translated_parts.append(result)
+
+    translated_md = "\n\n".join(translated_parts)
+    return _save_new_revision(db, session, narr, translated_md, f"translate:{req.target_lang}")
+
+
+def _save_new_revision(db, session, narr, new_md: str, model_tag: str) -> dict:
+    """Helper to save a new narrative revision."""
+    max_rev = db.query(func.max(Narrative.revision)).filter(Narrative.session_id == session.id).scalar()
+    new_revision = (max_rev or 0) + 1
+
+    new_narr = Narrative(
+        session_id=session.id,
+        revision=new_revision,
+        parent_revision=narr.revision,
+        content_md=new_md,
+        synthesis_model=model_tag,
+    )
+    db.add(new_narr)
+    db.commit()
+    return {"revision": new_revision, "content_length": len(new_md)}

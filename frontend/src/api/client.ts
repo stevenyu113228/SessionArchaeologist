@@ -80,6 +80,21 @@ export const api = {
       }),
     diff: (sessionId: string, rev1: number, rev2: number) =>
       fetchJson<{ diff: string }>(`/sessions/${sessionId}/narratives/diff/${rev1}/${rev2}`),
+    expandSection: (sessionId: string, revision: number, section_path: string) =>
+      fetchJson<{ revision: number }>(`/sessions/${sessionId}/narratives/${revision}/expand-section`, {
+        method: 'POST',
+        body: JSON.stringify({ section_path }),
+      }),
+    shrinkSection: (sessionId: string, revision: number, section_path: string) =>
+      fetchJson<{ revision: number }>(`/sessions/${sessionId}/narratives/${revision}/shrink-section`, {
+        method: 'POST',
+        body: JSON.stringify({ section_path }),
+      }),
+    translate: (sessionId: string, revision: number, target_lang = 'zh-TW') =>
+      fetchJson<{ revision: number }>(`/sessions/${sessionId}/narratives/${revision}/translate`, {
+        method: 'POST',
+        body: JSON.stringify({ target_lang }),
+      }),
   },
   search: {
     query: (sessionId: string, q: string, mode = 'semantic', filters?: Record<string, any>) =>

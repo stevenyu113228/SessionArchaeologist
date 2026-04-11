@@ -526,6 +526,14 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
             db2.commit()
 
             _push_pipeline(sid, {"type": "stage", "stage": "synthesize", "status": "done", "revision": revision, "chars": len(narrative_md)})
+
+            # --- Stage 4: Embed for RAG search ---
+            _push_pipeline(sid, {"type": "stage", "stage": "embed", "status": "running"})
+            from archaeologist.rag.store import embed_turns as do_embed
+            all_db_turns = db2.query(Turn).filter(Turn.session_id == session_uuid).order_by(Turn.turn_index).all()
+            embed_count = do_embed(str(session_uuid), all_db_turns)
+            _push_pipeline(sid, {"type": "stage", "stage": "embed", "status": "done", "embedded": embed_count})
+
             _push_pipeline(sid, {"type": "pipeline_done"})
         except Exception as e:
             _push_pipeline(sid, {"type": "error", "message": str(e)})

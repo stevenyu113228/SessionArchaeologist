@@ -3,13 +3,14 @@ import { useParams, Link } from 'react-router-dom';
 import {
   ChevronLeft, Download, GitCompare, Star,
   MessageSquarePlus, RefreshCw, Eye, Pen, Search,
+  Plus, Minus, Languages, Loader2,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { api } from '../api/client';
 import type { NarrativeDetail, NarrativeListItem } from '../api/types';
 import ExportModal from '../components/ExportModal';
 
-type AnnotationType = 'correction' | 'injection' | 'needs_detail' | 'tone_change';
+type AnnotationType = 'correction' | 'injection' | 'needs_detail' | 'tone_change' | 'add_subsection';
 type PendingAnnotation = {
   section_path: string;
   annotation_type: AnnotationType;
@@ -32,6 +33,8 @@ export default function NarrativeView() {
     section_path: '', annotation_type: 'correction', content: '', tone: '',
   });
   const [refining, setRefining] = useState(false);
+  const [sectionLoading, setSectionLoading] = useState<string | null>(null); // section_path being expanded/shrunk
+  const [translating, setTranslating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [score, setScore] = useState<number | null>(null);
 
@@ -114,6 +117,39 @@ export default function NarrativeView() {
     }
   };
 
+  const handleExpandSection = async (sectionSlug: string) => {
+    if (!id || !narrative) return;
+    setSectionLoading(sectionSlug);
+    try {
+      const { revision: newRev } = await api.narratives.expandSection(id, narrative.revision, sectionSlug);
+      window.location.href = `/session/${id}/narrative/${newRev}`;
+    } finally {
+      setSectionLoading(null);
+    }
+  };
+
+  const handleShrinkSection = async (sectionSlug: string) => {
+    if (!id || !narrative) return;
+    setSectionLoading(sectionSlug);
+    try {
+      const { revision: newRev } = await api.narratives.shrinkSection(id, narrative.revision, sectionSlug);
+      window.location.href = `/session/${id}/narrative/${newRev}`;
+    } finally {
+      setSectionLoading(null);
+    }
+  };
+
+  const handleTranslate = async () => {
+    if (!id || !narrative) return;
+    setTranslating(true);
+    try {
+      const { revision: newRev } = await api.narratives.translate(id, narrative.revision, 'zh-TW');
+      window.location.href = `/session/${id}/narrative/${newRev}`;
+    } finally {
+      setTranslating(false);
+    }
+  };
+
   if (!narrative) return <div className="p-6 text-[var(--text-muted)]">Loading...</div>;
 
   // Parse sections from markdown for annotation dropdown
@@ -189,6 +225,15 @@ export default function NarrativeView() {
                 ))}
               </select>
             )}
+            <button
+              onClick={handleTranslate}
+              disabled={translating}
+              className="flex items-center gap-1 px-2 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border)] rounded"
+              title="Translate to 繁體中文"
+            >
+              {translating ? <Loader2 size={14} className="animate-spin" /> : <Languages size={14} />}
+              中文
+            </button>
             <button onClick={() => setExportOpen(true)} className="p-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
               <Download size={16} />
             </button>
@@ -216,7 +261,36 @@ export default function NarrativeView() {
         <div className="flex-1 overflow-auto p-6">
           {mode === 'view' && (
             <article className="prose-custom max-w-none">
-              <ReactMarkdown>{narrative.content_md}</ReactMarkdown>
+              <ReactMarkdown components={{
+                h2: ({ children }) => {
+                  const text = String(children);
+                  const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+                  const isLoading = sectionLoading === slug;
+                  return (
+                    <div className="flex items-center gap-2 group">
+                      <h2>{children}</h2>
+                      <div className="opacity-0 group-hover:opacity-100 transition-opacity flex gap-1 shrink-0">
+                        <button
+                          onClick={() => handleExpandSection(slug)}
+                          disabled={isLoading}
+                          className="p-1 rounded text-[var(--accent-green)] hover:bg-[var(--accent-green)]/20"
+                          title="Expand with evidence from source"
+                        >
+                          {isLoading ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+                        </button>
+                        <button
+                          onClick={() => handleShrinkSection(slug)}
+                          disabled={isLoading}
+                          className="p-1 rounded text-[var(--accent-yellow)] hover:bg-[var(--accent-yellow)]/20"
+                          title="Shrink section"
+                        >
+                          <Minus size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                },
+              }}>{narrative.content_md}</ReactMarkdown>
             </article>
           )}
           {mode === 'edit' && (
@@ -290,6 +364,7 @@ export default function NarrativeView() {
                 <option value="correction">Correction — fix factual errors</option>
                 <option value="injection">Injection — add context AI couldn't know</option>
                 <option value="needs_detail">Needs Detail — enrich from raw data</option>
+                <option value="add_subsection">Add Subsection — AI searches & writes new content</option>
                 <option value="tone_change">Tone Change — adjust writing style</option>
               </select>
               {newAnnotation.annotation_type === 'tone_change' && (
@@ -314,6 +389,8 @@ export default function NarrativeView() {
                     ? 'Additional context to add...'
                     : newAnnotation.annotation_type === 'needs_detail'
                     ? 'What details are missing...'
+                    : newAnnotation.annotation_type === 'add_subsection'
+                    ? 'Topic for new subsection (AI will search source data)...'
                     : 'Describe desired tone...'
                 }
                 rows={3}
@@ -456,6 +533,7 @@ function TypeBadge({ type }: { type: string }) {
     correction: 'bg-[var(--accent-red)]/20 text-[var(--accent-red)]',
     injection: 'bg-[var(--accent-green)]/20 text-[var(--accent-green)]',
     needs_detail: 'bg-[var(--accent-yellow)]/20 text-[var(--accent-yellow)]',
+    add_subsection: 'bg-[var(--accent-blue)]/20 text-[var(--accent-blue)]',
     tone_change: 'bg-[var(--accent-purple)]/20 text-[var(--accent-purple)]',
   };
   return (
