@@ -6,6 +6,7 @@ import {
   Plus, Minus, Languages, Loader2,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api } from '../api/client';
 import type { NarrativeDetail, NarrativeListItem } from '../api/types';
 import ExportModal from '../components/ExportModal';
@@ -261,7 +262,7 @@ export default function NarrativeView() {
         <div className="flex-1 overflow-auto p-6">
           {mode === 'view' && (
             <article className="prose-custom max-w-none">
-              <ReactMarkdown components={{
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
                 h2: ({ children }) => {
                   const text = String(children);
                   const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
@@ -316,7 +317,7 @@ export default function NarrativeView() {
           {mode === 'annotate' && (
             <div className="flex flex-col gap-4">
               <article className="prose-custom max-w-none opacity-80">
-                <ReactMarkdown>{narrative.content_md}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{narrative.content_md}</ReactMarkdown>
               </article>
             </div>
           )}
