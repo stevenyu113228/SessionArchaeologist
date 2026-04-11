@@ -148,7 +148,7 @@ def _apply_auto(
         tool_handler=tool_handler,
         model=model,
         system=system,
-        max_iterations=12,
+        max_iterations=50,
     )
 
     # Agent should return the full narrative; if too short, it probably only returned a section
@@ -229,7 +229,7 @@ def _apply_with_agent(
         tool_handler=tool_handler,
         model=model,
         system=system,
-        max_iterations=10,
+        max_iterations=50,
     )
     return result
 

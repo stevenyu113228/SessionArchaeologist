@@ -17,7 +17,7 @@ def run_agent(
     tool_handler: Callable[[str, dict], str],
     model: str,
     system: str = "",
-    max_iterations: int = 15,
+    max_iterations: int = 50,
     on_step: Callable[[dict], None] | None = None,
 ) -> str:
     """Run a ReAct agent loop.
