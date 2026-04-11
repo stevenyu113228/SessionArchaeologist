@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
+import zipfile
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import orjson
 
@@ -24,6 +26,76 @@ ERROR_PATTERNS = re.compile(
 
 # Message types we extract as conversation turns
 TURN_TYPES = {"user", "assistant", "system"}
+
+
+def parse_project_zip(data: bytes) -> dict:
+    """Parse a zip containing a Claude Code project directory.
+
+    Expected structure inside the zip:
+      *.jsonl                         — main session file (largest)
+      {session-id}/subagents/agent-*.jsonl  — subagent sessions
+      {session-id}/subagents/agent-*.meta.json — subagent metadata
+      {session-id}/tool-results/*.txt — large tool output cache (optional)
+
+    Returns:
+      {
+        "main": {"turns": [...], "manifest": {...}},
+        "subagents": [
+          {"turns": [...], "manifest": {...}, "agent_id": "...",
+           "agent_type": "Explore", "description": "..."},
+          ...
+        ]
+      }
+    """
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = zf.namelist()
+
+    # Find all JSONL files
+    jsonl_files = [n for n in names if n.endswith(".jsonl")]
+
+    # Separate main session from subagent files
+    subagent_files = [n for n in jsonl_files if "/subagents/" in n]
+    main_candidates = [n for n in jsonl_files if n not in subagent_files]
+
+    if not main_candidates:
+        raise ValueError("No main session .jsonl found in zip")
+
+    # Pick largest JSONL as main session
+    main_file = max(main_candidates, key=lambda n: zf.getinfo(n).file_size)
+    main_data = zf.read(main_file)
+    main_turns, main_manifest = parse_jsonl_bytes(main_data, source_path=main_file)
+
+    # Parse subagents
+    subagents = []
+    for sa_file in subagent_files:
+        sa_data = zf.read(sa_file)
+        sa_turns, sa_manifest = parse_jsonl_bytes(sa_data, source_path=sa_file)
+
+        # Extract agent_id from filename: agent-{id}.jsonl
+        fname = PurePosixPath(sa_file).stem  # e.g. "agent-a6392f3ef3d631505"
+        agent_id = fname.replace("agent-", "") if fname.startswith("agent-") else fname
+
+        # Try to find matching .meta.json
+        meta_file = sa_file.replace(".jsonl", ".meta.json")
+        agent_type = ""
+        description = ""
+        if meta_file in names:
+            try:
+                meta = orjson.loads(zf.read(meta_file))
+                agent_type = meta.get("agentType", "")
+                description = meta.get("description", "")
+            except Exception:
+                pass
+
+        subagents.append({
+            "turns": sa_turns,
+            "manifest": sa_manifest,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "description": description,
+        })
+
+    return {"main": {"turns": main_turns, "manifest": main_manifest}, "subagents": subagents}
 
 
 def parse_jsonl_file(path: Path) -> tuple[list[dict], dict]:

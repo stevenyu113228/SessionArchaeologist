@@ -18,6 +18,14 @@ from archaeologist.db.models import Session
 router = APIRouter()
 
 
+class SubagentOut(BaseModel):
+    id: str
+    name: str
+    agent_type: Optional[str] = None
+    agent_description: Optional[str] = None
+    total_turns: int
+
+
 class SessionOut(BaseModel):
     id: str
     name: str
@@ -27,6 +35,9 @@ class SessionOut(BaseModel):
     total_tokens_est: int
     manifest: Optional[dict] = None
     status: str
+    session_type: str = "main"
+    subagents: list[SubagentOut] = []
+    parent_session_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -42,8 +53,19 @@ class SessionListOut(BaseModel):
 
 
 @router.get("", response_model=list[SessionListOut])
-def list_sessions(db: DBSession = Depends(get_db)):
-    sessions = db.query(Session).order_by(Session.imported_at.desc()).all()
+def list_sessions(parent: Optional[str] = Query(None), db: DBSession = Depends(get_db)):
+    q = db.query(Session)
+    if parent:
+        import uuid as _uuid
+        try:
+            pid = _uuid.UUID(parent)
+            q = q.filter(Session.parent_session_id == pid)
+        except ValueError:
+            pass
+    else:
+        # By default, hide subagents from top-level list
+        q = q.filter(Session.session_type != "subagent")
+    sessions = q.order_by(Session.imported_at.desc()).all()
     return [
         SessionListOut(
             id=str(s.id),
@@ -60,6 +82,16 @@ def list_sessions(db: DBSession = Depends(get_db)):
 @router.get("/{session_id}", response_model=SessionOut)
 def get_session(session_id: str, db: DBSession = Depends(get_db)):
     session = _find_session(db, session_id)
+
+    subs = db.query(Session).filter(Session.parent_session_id == session.id).all()
+    subagent_list = [
+        SubagentOut(
+            id=str(s.id), name=s.name, agent_type=s.agent_type,
+            agent_description=s.agent_description, total_turns=s.total_turns,
+        )
+        for s in subs
+    ]
+
     return SessionOut(
         id=str(session.id),
         name=session.name,
@@ -69,6 +101,9 @@ def get_session(session_id: str, db: DBSession = Depends(get_db)):
         total_tokens_est=session.total_tokens_est,
         manifest=session.manifest,
         status=session.status,
+        session_type=session.session_type,
+        subagents=subagent_list,
+        parent_session_id=str(session.parent_session_id) if session.parent_session_id else None,
     )
 
 
@@ -183,6 +218,89 @@ async def upload_session(
 
     db.commit()
     return {"id": str(session.id), "name": session_name, "total_turns": manifest["total_turns"]}
+
+
+def _store_turns(db: DBSession, session_id, turns_data: list[dict]):
+    from archaeologist.db.models import Turn
+
+    for td in turns_data:
+        db.add(Turn(
+            session_id=session_id,
+            turn_index=td["turn_index"], role=td["role"],
+            content_text=td["content_text"], tool_calls=td["tool_calls"],
+            is_compact_boundary=td["is_compact_boundary"], is_error=td["is_error"],
+            token_estimate=td["token_estimate"], content_hash=td["content_hash"],
+            timestamp=td["timestamp"], raw_jsonl_line=td["raw_jsonl_line"],
+            message_uuid=td["message_uuid"], parent_uuid=td["parent_uuid"],
+            is_sidechain=td["is_sidechain"], model_used=td["model_used"],
+            token_usage=td["token_usage"], has_thinking=td["has_thinking"],
+        ))
+
+
+@router.post("/upload-project")
+async def upload_project(
+    file: UploadFile = File(...),
+    name: Optional[str] = Query(None),
+    db: DBSession = Depends(get_db),
+):
+    """Upload a .zip project containing main session + subagent sessions."""
+    from archaeologist.parser.jsonl import parse_project_zip
+
+    if not file.filename or not file.filename.endswith(".zip"):
+        raise HTTPException(400, "File must be a .zip file")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+
+    project = parse_project_zip(data)
+    main = project["main"]
+    main_manifest = main["manifest"]
+    session_name = name or main_manifest.get("session_slug") or file.filename.rsplit(".", 1)[0]
+
+    parent = Session(
+        name=session_name,
+        source_path=f"upload-project:{file.filename}",
+        total_turns=main_manifest["total_turns"],
+        total_tokens_est=main_manifest["total_tokens_est"],
+        manifest=main_manifest,
+        status="imported",
+        session_type="main",
+    )
+    db.add(parent)
+    db.flush()
+    _store_turns(db, parent.id, main["turns"])
+
+    subagent_results = []
+    for sa in project["subagents"]:
+        sa_manifest = sa["manifest"]
+        sa_name = sa["description"][:80] if sa["description"] else sa["agent_id"][:20]
+        child = Session(
+            name=sa_name,
+            source_path=f"subagent:{sa['agent_id']}",
+            total_turns=sa_manifest["total_turns"],
+            total_tokens_est=sa_manifest["total_tokens_est"],
+            manifest=sa_manifest,
+            status="imported",
+            parent_session_id=parent.id,
+            session_type="subagent",
+            agent_type=sa["agent_type"],
+            agent_description=sa["description"],
+        )
+        db.add(child)
+        db.flush()
+        _store_turns(db, child.id, sa["turns"])
+        subagent_results.append({
+            "id": str(child.id), "name": sa_name,
+            "agent_type": sa["agent_type"], "description": sa["description"],
+            "total_turns": sa_manifest["total_turns"],
+        })
+
+    db.commit()
+    return {
+        "id": str(parent.id), "name": session_name,
+        "total_turns": main_manifest["total_turns"], "subagents": subagent_results,
+    }
 
 
 @router.delete("/{session_id}")

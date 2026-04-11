@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Upload, Database, Clock, AlertTriangle, FileUp } from 'lucide-react';
 import { api } from '../api/client';
 import type { SessionListItem } from '../api/types';
@@ -10,14 +10,17 @@ export default function Dashboard() {
   const [error, setError] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     api.sessions.list().then(setSessions).catch(e => setError(e.message));
   }, []);
 
   const uploadFile = useCallback(async (file: File) => {
-    if (!file.name.endsWith('.jsonl')) {
-      setError('Please upload a .jsonl file');
+    const isZip = file.name.endsWith('.zip');
+    const isJsonl = file.name.endsWith('.jsonl');
+    if (!isZip && !isJsonl) {
+      setError('Please upload a .jsonl or .zip file');
       return;
     }
     setImporting(true);
@@ -26,20 +29,20 @@ export default function Dashboard() {
       const formData = new FormData();
       formData.append('file', file);
 
-      const res = await fetch('/api/sessions/upload', { method: 'POST', body: formData });
+      const endpoint = isZip ? '/api/sessions/upload-project' : '/api/sessions/upload';
+      const res = await fetch(endpoint, { method: 'POST', body: formData });
       if (!res.ok) {
         const body = await res.text();
         throw new Error(`${res.status}: ${body}`);
       }
-
-      const updated = await api.sessions.list();
-      setSessions(updated);
+      const data = await res.json();
+      // Auto-navigate to session with autorun
+      navigate(`/session/${data.id}?autorun=true`);
     } catch (e: any) {
       setError(e.message);
-    } finally {
       setImporting(false);
     }
-  }, []);
+  }, [navigate]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -87,14 +90,15 @@ export default function Dashboard() {
         >
           <FileUp size={32} className="text-[var(--text-muted)]" />
           {importing ? (
-            <p className="text-sm text-[var(--text-secondary)]">Importing...</p>
+            <p className="text-sm text-[var(--text-secondary)]">Importing & starting pipeline...</p>
           ) : (
             <>
               <p className="text-sm text-[var(--text-secondary)]">
-                Drop a <span className="mono text-[var(--text-primary)]">.jsonl</span> file here, or click to browse
+                Drop a <span className="mono text-[var(--text-primary)]">.jsonl</span> or{' '}
+                <span className="mono text-[var(--text-primary)]">.zip</span> file here, or click to browse
               </p>
               <p className="text-xs text-[var(--text-muted)]">
-                Claude Code session files from ~/.claude/projects/
+                .jsonl = single session &nbsp;|&nbsp; .zip = project with subagents (auto-runs full pipeline)
               </p>
             </>
           )}
@@ -102,7 +106,7 @@ export default function Dashboard() {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".jsonl"
+          accept=".jsonl,.zip"
           onChange={handleFileSelect}
           className="hidden"
         />
@@ -122,7 +126,7 @@ export default function Dashboard() {
             </tr>
           </thead>
           <tbody>
-            {sessions.map(s => (
+            {sessions.filter(s => s.status !== 'subagent_placeholder').map(s => (
               <tr key={s.id} className="border-b border-[var(--border)] hover:bg-[var(--bg-tertiary)] transition-colors">
                 <td className="px-4 py-3">
                   <Link to={`/session/${s.id}`} className="text-[var(--accent-blue)] hover:underline no-underline">
@@ -142,7 +146,7 @@ export default function Dashboard() {
             {sessions.length === 0 && (
               <tr>
                 <td colSpan={5} className="px-4 py-8 text-center text-[var(--text-muted)]">
-                  No sessions yet. Upload a .jsonl file to get started.
+                  No sessions yet. Upload a .jsonl or .zip file to get started.
                 </td>
               </tr>
             )}
@@ -168,7 +172,9 @@ function StatusBadge({ status }: { status: string }) {
   const colors: Record<string, string> = {
     imported: 'bg-[var(--text-muted)]/20 text-[var(--text-secondary)]',
     chunked: 'bg-[var(--accent-blue)]/20 text-[var(--accent-blue)]',
+    extracting: 'bg-[var(--accent-yellow)]/20 text-[var(--accent-yellow)]',
     extracted: 'bg-[var(--accent-yellow)]/20 text-[var(--accent-yellow)]',
+    synthesizing: 'bg-[var(--accent-blue)]/20 text-[var(--accent-blue)]',
     synthesized: 'bg-[var(--accent-green)]/20 text-[var(--accent-green)]',
     refining: 'bg-[var(--accent-purple)]/20 text-[var(--accent-purple)]',
   };

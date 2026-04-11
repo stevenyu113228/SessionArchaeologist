@@ -33,11 +33,23 @@ class Session(Base):
     manifest: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(
         String(50), default="imported"
-    )  # imported, chunked, extracted, synthesized, refining
+    )  # imported, chunked, extracting, extracted, synthesizing, synthesized, refining
+
+    # Subagent support
+    parent_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True
+    )
+    session_type: Mapped[str] = mapped_column(String(20), default="main")  # main, subagent
+    agent_type: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Explore, Plan, etc.
+    agent_description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
 
     turns: Mapped[list["Turn"]] = relationship(back_populates="session", cascade="all, delete-orphan")
     chunks: Mapped[list["Chunk"]] = relationship(back_populates="session", cascade="all, delete-orphan")
     narratives: Mapped[list["Narrative"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    subagents: Mapped[list["Session"]] = relationship("Session", back_populates="parent_session")
+    parent_session: Mapped["Session | None"] = relationship(
+        "Session", remote_side=[id], back_populates="subagents"
+    )
 
 
 class Turn(Base):
@@ -91,6 +103,7 @@ class Chunk(Base):
     extraction_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     extraction_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     extraction_cost_est: Mapped[float | None] = mapped_column(Float, nullable=True)
+    artifact_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     session: Mapped["Session"] = relationship(back_populates="chunks")
 

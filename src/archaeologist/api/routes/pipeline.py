@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -351,6 +352,210 @@ async def synthesis_progress_sse(session_id: str, request: Request, db: DBSessio
                 if evt.get("type") == "done":
                     return
 
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline auto-run (chunk → extract → synthesize in one shot)
+# ---------------------------------------------------------------------------
+_pipeline_progress: dict[str, list[dict]] = {}
+
+
+def _push_pipeline(sid: str, event: dict):
+    if sid not in _pipeline_progress:
+        _pipeline_progress[sid] = []
+    _pipeline_progress[sid].append(event)
+
+
+@router.post("/sessions/{session_id}/run-pipeline")
+def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
+    """Auto-run full pipeline: chunk → extract → synthesize. Returns immediately."""
+    from archaeologist.db.models import Chunk
+
+    session = _find_session(db, session_id)
+    sid = str(session.id)
+    session_uuid = session.id
+
+    # Merge subagent turns into parent if applicable
+    subagent_ids = []
+    if session.session_type == "main":
+        from archaeologist.db.models import Session as SessionModel
+        subs = db.query(SessionModel).filter(SessionModel.parent_session_id == session.id).all()
+        subagent_ids = [str(s.id) for s in subs]
+
+    _pipeline_progress[sid] = []
+    _push_pipeline(sid, {"type": "started"})
+
+    def _run():
+        from archaeologist.db.session import SessionLocal
+        from archaeologist.db.models import Chunk, Turn, Narrative, Session as SM
+        from archaeologist.chunker.engine import chunk_session
+        from archaeologist.extractor.agent import extract_chunk
+        from archaeologist.synthesizer.agent import synthesize_narrative
+        from sqlalchemy import func
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+
+        db2 = SessionLocal()
+        try:
+            session = db2.query(SM).filter(SM.id == session_uuid).first()
+
+            # --- Stage 1: Chunk ---
+            _push_pipeline(sid, {"type": "stage", "stage": "chunk", "status": "running"})
+
+            # Gather turns — main + subagent if applicable
+            turns = list(db2.query(Turn).filter(Turn.session_id == session_uuid).order_by(Turn.turn_index).all())
+
+            if subagent_ids:
+                import uuid as _uuid
+                for sa_id in subagent_ids:
+                    sa_turns = db2.query(Turn).filter(
+                        Turn.session_id == _uuid.UUID(sa_id)
+                    ).order_by(Turn.turn_index).all()
+                    turns.extend(sa_turns)
+                # Re-sort by timestamp for chronological merge
+                turns.sort(key=lambda t: t.timestamp or datetime(2000, 1, 1))
+                # Re-index
+                for i, t_obj in enumerate(turns):
+                    pass  # keep original turn_index for DB reference
+
+            turn_dicts = [
+                {
+                    "turn_index": i,
+                    "token_estimate": t.token_estimate,
+                    "timestamp": t.timestamp,
+                    "role": t.role,
+                    "is_compact_boundary": t.is_compact_boundary,
+                    "is_error": t.is_error,
+                    "tool_calls": t.tool_calls,
+                    "content_text": t.content_text,
+                }
+                for i, t in enumerate(turns)
+            ]
+
+            chunks_data = chunk_session(turn_dicts, session.manifest or {})
+
+            db2.query(Chunk).filter(Chunk.session_id == session_uuid).delete()
+            chunk_records = []
+            for cd in chunks_data:
+                c = Chunk(
+                    session_id=session_uuid,
+                    chunk_index=cd["chunk_index"],
+                    start_turn=cd["start_turn"],
+                    end_turn=cd["end_turn"],
+                    overlap_start_turn=cd.get("overlap_start_turn"),
+                    token_estimate=cd["token_estimate"],
+                    hot_zone_count=cd["hot_zone_count"],
+                    contains_compact_boundary=cd["contains_compact_boundary"],
+                )
+                db2.add(c)
+                chunk_records.append(c)
+            session.status = "chunked"
+            db2.commit()
+            # Refresh to get IDs
+            for c in chunk_records:
+                db2.refresh(c)
+
+            total_chunks = len(chunk_records)
+            _push_pipeline(sid, {"type": "stage", "stage": "chunk", "status": "done", "chunks": total_chunks})
+
+            # --- Stage 2: Extract (parallel) ---
+            _push_pipeline(sid, {"type": "stage", "stage": "extract", "status": "running", "total": total_chunks})
+
+            max_workers = min(settings.max_parallel_extractions, total_chunks)
+
+            def extract_one(chunk_info):
+                cid, cidx, start, end, overlap = chunk_info
+                from archaeologist.db.session import SessionLocal as SL2
+                db3 = SL2()
+                try:
+                    chunk_turns = turn_dicts[start:end + 1]
+                    # Build pseudo-Turn objects for extractor
+                    _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "running"})
+                    t0 = time.time()
+                    result = extract_chunk(
+                        turns=chunk_turns, chunk_id=cidx, total_chunks=total_chunks,
+                        has_overlap=overlap is not None, overlap_tokens=0,
+                        model=settings.extraction_model,
+                    )
+                    elapsed = time.time() - t0
+                    c = db3.query(Chunk).filter(Chunk.id == cid).first()
+                    if c:
+                        c.extraction_result = result
+                        c.extraction_status = "done"
+                        c.extraction_model = settings.extraction_model
+                        db3.commit()
+                    _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "done", "elapsed": round(elapsed, 1)})
+                finally:
+                    db3.close()
+
+            chunk_infos = [(c.id, c.chunk_index, c.start_turn, c.end_turn, c.overlap_start_turn) for c in chunk_records]
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(extract_one, chunk_infos))
+
+            session = db2.query(SM).filter(SM.id == session_uuid).first()
+            session.status = "extracted"
+            db2.commit()
+            _push_pipeline(sid, {"type": "stage", "stage": "extract", "status": "done"})
+
+            # --- Stage 3: Synthesize ---
+            _push_pipeline(sid, {"type": "stage", "stage": "synthesize", "status": "running"})
+
+            chunks_done = db2.query(Chunk).filter(
+                Chunk.session_id == session_uuid, Chunk.extraction_status == "done"
+            ).order_by(Chunk.chunk_index).all()
+            extractions = [c.extraction_result for c in chunks_done]
+
+            def on_synth_progress(evt):
+                _push_pipeline(sid, {"type": "synth_progress", **evt})
+
+            narrative_md = synthesize_narrative(extractions, model=settings.synthesis_model, on_progress=on_synth_progress)
+
+            max_rev = db2.query(func.max(Narrative.revision)).filter(Narrative.session_id == session_uuid).scalar()
+            revision = (max_rev or 0) + 1
+            narr = Narrative(
+                session_id=session_uuid, revision=revision,
+                content_md=narrative_md, synthesis_model=settings.synthesis_model,
+            )
+            db2.add(narr)
+            session = db2.query(SM).filter(SM.id == session_uuid).first()
+            session.status = "synthesized"
+            db2.commit()
+
+            _push_pipeline(sid, {"type": "stage", "stage": "synthesize", "status": "done", "revision": revision, "chars": len(narrative_md)})
+            _push_pipeline(sid, {"type": "pipeline_done"})
+        except Exception as e:
+            _push_pipeline(sid, {"type": "error", "message": str(e)})
+        finally:
+            db2.close()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return {"status": "started", "subagents_merged": len(subagent_ids)}
+
+
+@router.get("/sessions/{session_id}/run-pipeline/progress")
+async def pipeline_progress_sse(session_id: str, request: Request, db: DBSession = Depends(get_db)):
+    """SSE endpoint — streams full pipeline progress."""
+    session = _find_session(db, session_id)
+    sid = str(session.id)
+
+    async def event_stream():
+        cursor = 0
+        while True:
+            if await request.is_disconnected():
+                break
+            events = _pipeline_progress.get(sid, [])
+            while cursor < len(events):
+                evt = events[cursor]
+                yield f"data: {json.dumps(evt)}\n\n"
+                cursor += 1
+                if evt.get("type") in ("pipeline_done", "error"):
+                    return
             await asyncio.sleep(0.5)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

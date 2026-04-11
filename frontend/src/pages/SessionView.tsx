@@ -1,11 +1,14 @@
-import { useEffect, useState } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { ChevronLeft, Play, Zap, AlertCircle, Flame, BookOpen } from 'lucide-react';
+import { useEffect, useState, useRef } from 'react';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
+import { ChevronLeft, Play, Zap, AlertCircle, Flame, BookOpen, GitBranch } from 'lucide-react';
 import { api } from '../api/client';
 import type { SessionDetail, Chunk, Turn, TurnsPage, NarrativeListItem, PipelineStatus } from '../api/types';
 
+type Subagent = { id: string; name: string; agent_type: string; agent_description: string; total_turns: number };
+
 export default function SessionView() {
   const { id } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
   const [session, setSession] = useState<SessionDetail | null>(null);
   const [chunks, setChunks] = useState<Chunk[]>([]);
   const [turnsPage, setTurnsPage] = useState<TurnsPage | null>(null);
@@ -16,6 +19,9 @@ export default function SessionView() {
   const [tab, setTab] = useState<'overview' | 'turns' | 'timeline' | 'narratives'>('overview');
   const [extractProgress, setExtractProgress] = useState<{ done: number; total: number; current: number; elapsed: number[] } | null>(null);
   const [synthProgress, setSynthProgress] = useState<string | null>(null);
+  const [pipelineLog, setPipelineLog] = useState<string[]>([]);
+  const [_subagents, _setSubagents] = useState<Subagent[]>([]); // loaded via session detail
+  const autorunTriggered = useRef(false);
 
   const load = async () => {
     if (!id) return;
@@ -34,6 +40,42 @@ export default function SessionView() {
   };
 
   useEffect(() => { load(); }, [id]);
+
+  // subagents are loaded via session detail response (session.subagents)
+
+  // Auto-run pipeline on mount if ?autorun=true
+  useEffect(() => {
+    if (!id || !session || autorunTriggered.current) return;
+    if (searchParams.get('autorun') !== 'true') return;
+    if (session.status !== 'imported') return;
+
+    autorunTriggered.current = true;
+    setLoading('pipeline');
+    setPipelineLog(['Starting full pipeline...']);
+
+    api.pipeline.runAll(id).then(() => {
+      api.pipeline.runAllProgress(id, (evt) => {
+        if (evt.type === 'stage') {
+          setPipelineLog(prev => [...prev, `${evt.stage}: ${evt.status}${evt.chunks ? ` (${evt.chunks} chunks)` : ''}${evt.chars ? ` (${evt.chars} chars)` : ''}`]);
+        } else if (evt.type === 'extract_chunk') {
+          setPipelineLog(prev => {
+            const msg = `  Chunk ${evt.chunk}/${evt.total}: ${evt.status}${evt.elapsed ? ` (${evt.elapsed}s)` : ''}`;
+            return [...prev.filter(l => !l.startsWith(`  Chunk ${evt.chunk}/`)), msg];
+          });
+        } else if (evt.type === 'synth_progress') {
+          setPipelineLog(prev => [...prev, `  ${evt.detail || evt.step || 'processing...'}`]);
+        }
+      }, async () => {
+        setLoading('');
+        await load();
+        // Auto-navigate to narrative if one was created
+        const narrs = await api.narratives.list(id).catch(() => []);
+        if (narrs.length > 0) {
+          setTab('narratives');
+        }
+      });
+    }).catch(() => setLoading(''));
+  }, [id, session, searchParams]);
 
   const loadTurns = async (offset: number) => {
     if (!id) return;
@@ -174,7 +216,45 @@ export default function SessionView() {
             )}
           </div>
         </div>
+        {/* Auto-run pipeline button */}
+        {session.status === 'imported' && loading !== 'pipeline' && (
+          <button
+            onClick={() => {
+              if (!id) return;
+              setLoading('pipeline');
+              setPipelineLog(['Starting full pipeline...']);
+              api.pipeline.runAll(id).then(() => {
+                api.pipeline.runAllProgress(id, (evt) => {
+                  if (evt.type === 'stage') {
+                    setPipelineLog(prev => [...prev, `${evt.stage}: ${evt.status}`]);
+                  } else if (evt.type === 'extract_chunk') {
+                    setPipelineLog(prev => [...prev.filter(l => !l.startsWith(`  Chunk ${evt.chunk}/`)),
+                      `  Chunk ${evt.chunk}/${evt.total}: ${evt.status}${evt.elapsed ? ` (${evt.elapsed}s)` : ''}`]);
+                  } else if (evt.type === 'synth_progress') {
+                    setPipelineLog(prev => [...prev, `  ${evt.detail || evt.step}`]);
+                  }
+                }, async () => { setLoading(''); await load(); });
+              });
+            }}
+            className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-[var(--accent-green)] text-black font-medium rounded text-sm"
+          >
+            <Play size={14} /> Run Full Pipeline (Chunk → Extract → Synthesize)
+          </button>
+        )}
       </div>
+
+      {/* Pipeline progress log */}
+      {pipelineLog.length > 0 && loading === 'pipeline' && (
+        <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-6">
+          <h3 className="text-xs font-semibold mb-2 text-[var(--text-secondary)]">Pipeline Progress</h3>
+          <div className="mono text-xs space-y-0.5 max-h-40 overflow-auto">
+            {pipelineLog.map((line, i) => (
+              <div key={i} className={line.startsWith('  ') ? 'text-[var(--text-muted)] pl-3' : 'text-[var(--accent-green)]'}>{line}</div>
+            ))}
+            <div className="text-[var(--accent-blue)] animate-pulse">Processing...</div>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-[var(--border)]">
@@ -243,6 +323,32 @@ export default function SessionView() {
                     <span>Turns {hz.start_turn}–{hz.end_turn}</span>
                     <span className="text-[var(--accent-yellow)]">{hz.turn_count} turns</span>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Subagents */}
+          {session.manifest && (session as any).subagents && (session as any).subagents.length > 0 && (
+            <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4">
+              <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">
+                <GitBranch size={14} className="text-[var(--accent-purple)]" /> Subagents ({(session as any).subagents.length})
+              </h3>
+              <div className="space-y-2 text-sm">
+                {(session as any).subagents.map((sa: any) => (
+                  <Link
+                    key={sa.id}
+                    to={`/session/${sa.id}`}
+                    className="flex justify-between items-center p-2 rounded hover:bg-[var(--bg-tertiary)] no-underline transition-colors"
+                  >
+                    <div>
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--accent-purple)]/20 text-[var(--accent-purple)] mr-2">
+                        {sa.agent_type || 'Agent'}
+                      </span>
+                      <span className="text-[var(--text-secondary)]">{sa.agent_description || sa.name}</span>
+                    </div>
+                    <span className="mono text-[var(--text-muted)] text-xs">{sa.total_turns} turns</span>
+                  </Link>
                 ))}
               </div>
             </div>

@@ -124,5 +124,20 @@ export const api = {
       es.onerror = () => { es.close(); onDone(); };
       return es;
     },
+    runAll: (sessionId: string) =>
+      fetchJson<{ status: string }>(`/sessions/${sessionId}/run-pipeline`, { method: 'POST' }),
+    runAllProgress: (sessionId: string, onEvent: (evt: any) => void, onDone: () => void) => {
+      const es = new EventSource(`${BASE}/sessions/${sessionId}/run-pipeline/progress`);
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        onEvent(data);
+        if (data.type === 'pipeline_done' || data.type === 'error') {
+          es.close();
+          onDone();
+        }
+      };
+      es.onerror = () => { es.close(); onDone(); };
+      return es;
+    },
   },
 };
