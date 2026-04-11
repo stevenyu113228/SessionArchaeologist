@@ -1,0 +1,40 @@
+[project]
+name = "session-archaeologist"
+version = "0.1.0"
+description = "Transform Claude Code session histories into structured research narratives"
+requires-python = ">=3.10"
+dependencies = [
+    # Backend framework (Phase 2)
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    # Database
+    "sqlalchemy>=2.0",
+    "alembic>=1.14",
+    "psycopg2-binary>=2.9",
+    # Task queue
+    "celery[redis]>=5.4",
+    # LLM clients
+    "anthropic>=0.52",
+    "openai>=1.82",
+    # CLI
+    "typer>=0.15",
+    "rich>=13.9",
+    # Config
+    "pydantic-settings>=2.7",
+    # JSON parsing
+    "orjson>=3.10",
+    # YAML (for feedback files)
+    "pyyaml>=6.0",
+    # Retry logic
+    "tenacity>=9.0",
+]
+
+[project.scripts]
+archaeologist = "archaeologist.cli:app"
+
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
