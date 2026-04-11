@@ -383,6 +383,63 @@ def extract(
 
 
 # ---------------------------------------------------------------------------
+# embed
+# ---------------------------------------------------------------------------
+@app.command()
+def embed(
+    session_id: str = typer.Argument(..., help="Session ID (or prefix)"),
+):
+    """Embed all turns for RAG search."""
+    from archaeologist.db.models import Turn
+    from archaeologist.db.session import SessionLocal
+    from archaeologist.rag.store import embed_turns
+
+    db = SessionLocal()
+    try:
+        session = _resolve_session(db, session_id)
+        turns = db.query(Turn).filter(Turn.session_id == session.id).order_by(Turn.turn_index).all()
+        rprint(f"Embedding [cyan]{len(turns)}[/cyan] turns for session [cyan]{session.name}[/cyan]...")
+        count = embed_turns(str(session.id), turns)
+        rprint(f"[green]✓[/green] Embedded {count} documents into vector store")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+@app.command()
+def search(
+    session_id: str = typer.Argument(..., help="Session ID (or prefix)"),
+    query: str = typer.Argument(..., help="Search query"),
+    mode: str = typer.Option("semantic", "--mode", "-m", help="Search mode: semantic|keyword"),
+    limit: int = typer.Option(5, "--limit", "-l", help="Number of results"),
+):
+    """Search session content via RAG."""
+    from archaeologist.db.session import SessionLocal
+    from archaeologist.rag.store import search as rag_search
+
+    db = SessionLocal()
+    try:
+        session = _resolve_session(db, session_id)
+        results = rag_search(str(session.id), query, mode=mode, n_results=limit)
+
+        if not results:
+            rprint("[dim]No results found.[/dim]")
+            return
+
+        for r in results:
+            role_color = {"user": "green", "assistant": "blue"}.get(r.get("role", ""), "white")
+            preview = r["content_text"][:200].replace("\n", " ")
+            rprint(
+                f"  [{role_color}]#{r['turn_index']} {r['role']}[/{role_color}]"
+                f" [dim](score: {r['score']:.3f})[/dim]: {preview}"
+            )
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # synthesize
 # ---------------------------------------------------------------------------
 @app.command()

@@ -176,6 +176,56 @@ def refine_narrative(
     return {"revision": new_revision, "content_length": len(new_md)}
 
 
+class UpdateNarrativeRequest(BaseModel):
+    content_md: str
+
+
+@router.put("/{session_id}/narratives/{revision}")
+def update_narrative(
+    session_id: str, revision: int, req: UpdateNarrativeRequest, db: DBSession = Depends(get_db)
+):
+    """Direct edit of narrative content — creates a new revision."""
+    session = _find_session(db, session_id)
+    narr = db.query(Narrative).filter(
+        Narrative.session_id == session.id, Narrative.revision == revision
+    ).first()
+    if not narr:
+        raise HTTPException(404, f"Revision {revision} not found")
+
+    max_rev = db.query(func.max(Narrative.revision)).filter(Narrative.session_id == session.id).scalar()
+    new_revision = (max_rev or 0) + 1
+
+    new_narr = Narrative(
+        session_id=session.id,
+        revision=new_revision,
+        parent_revision=revision,
+        content_md=req.content_md,
+        synthesis_model="manual_edit",
+    )
+    db.add(new_narr)
+    db.commit()
+    return {"revision": new_revision, "content_length": len(req.content_md)}
+
+
+class ScoreRequest(BaseModel):
+    score: int
+
+
+@router.post("/{session_id}/narratives/{revision}/score")
+def score_narrative(
+    session_id: str, revision: int, req: ScoreRequest, db: DBSession = Depends(get_db)
+):
+    session = _find_session(db, session_id)
+    narr = db.query(Narrative).filter(
+        Narrative.session_id == session.id, Narrative.revision == revision
+    ).first()
+    if not narr:
+        raise HTTPException(404, f"Revision {revision} not found")
+    narr.user_score = req.score
+    db.commit()
+    return {"revision": revision, "score": req.score}
+
+
 @router.get("/{session_id}/narratives/diff/{rev1}/{rev2}")
 def diff_narratives(session_id: str, rev1: int, rev2: int, db: DBSession = Depends(get_db)):
     session = _find_session(db, session_id)

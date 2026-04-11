@@ -54,8 +54,39 @@ export const api = {
     list: (sessionId: string) => fetchJson<NarrativeListItem[]>(`/sessions/${sessionId}/narratives`),
     get: (sessionId: string, revision: number) =>
       fetchJson<NarrativeDetail>(`/sessions/${sessionId}/narratives/${revision}`),
+    update: (sessionId: string, revision: number, content_md: string) =>
+      fetchJson<{ revision: number }>(`/sessions/${sessionId}/narratives/${revision}`, {
+        method: 'PUT',
+        body: JSON.stringify({ content_md }),
+      }),
+    score: (sessionId: string, revision: number, score: number) =>
+      fetchJson<{ score: number }>(`/sessions/${sessionId}/narratives/${revision}/score`, {
+        method: 'POST',
+        body: JSON.stringify({ score }),
+      }),
+    annotate: (sessionId: string, revision: number, annotation: {
+      section_path: string; annotation_type: string; content: string; tone?: string;
+    }) =>
+      fetchJson<{ id: string }>(`/sessions/${sessionId}/narratives/${revision}/annotate`, {
+        method: 'POST',
+        body: JSON.stringify(annotation),
+      }),
+    refine: (sessionId: string, revision: number, annotations: {
+      section_path: string; annotation_type: string; content: string; tone?: string;
+    }[]) =>
+      fetchJson<{ revision: number }>(`/sessions/${sessionId}/narratives/${revision}/refine`, {
+        method: 'POST',
+        body: JSON.stringify({ annotations }),
+      }),
     diff: (sessionId: string, rev1: number, rev2: number) =>
       fetchJson<{ diff: string }>(`/sessions/${sessionId}/narratives/diff/${rev1}/${rev2}`),
+  },
+  search: {
+    query: (sessionId: string, q: string, mode = 'semantic', filters?: Record<string, any>) =>
+      fetchJson<{ results: any[] }>(`/sessions/${sessionId}/search`, {
+        method: 'POST',
+        body: JSON.stringify({ query: q, mode, filters }),
+      }),
   },
   pipeline: {
     status: (sessionId: string) => fetchJson<PipelineStatus>(`/pipeline/${sessionId}`),

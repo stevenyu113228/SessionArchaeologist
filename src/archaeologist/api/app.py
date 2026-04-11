@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from archaeologist.api.routes import sessions, turns, chunks, narratives, pipeline
+from archaeologist.api.routes import sessions, turns, chunks, narratives, pipeline, search, export
 
 app = FastAPI(
     title="SessionArchaeologist",
@@ -24,6 +24,8 @@ app.include_router(turns.router, prefix="/api/sessions", tags=["turns"])
 app.include_router(chunks.router, prefix="/api/sessions", tags=["chunks"])
 app.include_router(narratives.router, prefix="/api/sessions", tags=["narratives"])
 app.include_router(pipeline.router, prefix="/api", tags=["pipeline"])
+app.include_router(search.router, prefix="/api/sessions", tags=["search"])
+app.include_router(export.router, prefix="/api/sessions", tags=["export"])
 
 
 @app.get("/api/health")
