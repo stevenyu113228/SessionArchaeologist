@@ -81,8 +81,12 @@ export default function NarrativeView() {
   };
 
   const addAnnotation = () => {
-    if (!newAnnotation.section_path || !newAnnotation.content) return;
-    setAnnotations([...annotations, { ...newAnnotation }]);
+    if (!newAnnotation.content) return;
+    // Allow empty section_path = "auto" mode
+    setAnnotations([...annotations, {
+      ...newAnnotation,
+      section_path: newAnnotation.section_path || 'auto',
+    }]);
     setNewAnnotation({ section_path: '', annotation_type: 'correction', content: '', tone: '' });
   };
 
@@ -153,15 +157,31 @@ export default function NarrativeView() {
 
   if (!narrative) return <div className="p-6 text-[var(--text-muted)]">Loading...</div>;
 
-  // Parse sections from markdown for annotation dropdown
-  const sections = narrative.content_md
-    .split('\n')
-    .filter(l => l.startsWith('#'))
-    .map(l => {
-      const text = l.replace(/^#+\s*/, '').trim();
-      const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-      return { text, slug };
-    });
+  // Parse sections from markdown for annotation dropdown — with hierarchy
+  const sections = (() => {
+    const lines = narrative.content_md.split('\n');
+    const result: { text: string; slug: string; level: number; chars: number }[] = [];
+    let prevIdx = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^(#{1,6})\s+(.+)/);
+      if (m) {
+        if (result.length > 0) {
+          result[result.length - 1].chars = lines.slice(prevIdx, i).join('\n').length;
+        }
+        const level = m[1].length;
+        const text = m[2].trim();
+        const slug = text.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+        result.push({ text, slug, level, chars: 0 });
+        prevIdx = i;
+      }
+    }
+    if (result.length > 0) {
+      result[result.length - 1].chars = lines.slice(prevIdx).join('\n').length;
+    }
+    // Only show ## and ### headings (skip # title)
+    return result.filter(s => s.level >= 2 && s.level <= 3);
+  })();
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -352,9 +372,11 @@ export default function NarrativeView() {
                 onChange={e => setNewAnnotation({ ...newAnnotation, section_path: e.target.value })}
                 className="w-full px-2 py-1.5 bg-[var(--bg-secondary)] border border-[var(--border)] rounded text-xs text-[var(--text-primary)]"
               >
-                <option value="">Select section...</option>
+                <option value="">Auto — let AI find the right section</option>
                 {sections.map(s => (
-                  <option key={s.slug} value={s.slug}>{s.text}</option>
+                  <option key={s.slug} value={s.slug}>
+                    {s.level === 3 ? '    └ ' : ''}{s.text} ({Math.round(s.chars / 1000)}K chars)
+                  </option>
                 ))}
               </select>
               <select

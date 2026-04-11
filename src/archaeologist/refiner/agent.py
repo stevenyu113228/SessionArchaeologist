@@ -38,6 +38,21 @@ def refine_narrative(
 
         logger.info("Processing %s annotation for section: %s", ann_type, section_path)
 
+        # Auto mode: let agent figure out where to apply
+        if not section_path or section_path == "auto":
+            new_narrative = _apply_auto(
+                narrative=narrative,
+                ann_type=ann_type,
+                content=content,
+                tone=tone,
+                session_id=session_id,
+                manifest=manifest,
+                model=model,
+            )
+            if new_narrative:
+                narrative = new_narrative
+            continue
+
         section_text = _find_section(narrative, section_path)
         if not section_text:
             logger.warning("Section not found: %s — applying to full narrative", section_path)
@@ -79,6 +94,68 @@ def refine_narrative(
             narrative = narrative.replace(section_text, new_section, 1)
 
     return narrative
+
+
+def _apply_auto(
+    narrative: str,
+    ann_type: str,
+    content: str,
+    tone: str,
+    session_id: str,
+    manifest: dict | None = None,
+    model: str = "",
+) -> str | None:
+    """Auto mode: agent reads the narrative, decides where to apply the annotation, and returns the updated full narrative."""
+    tool_handler = create_tool_handler(
+        session_id=session_id,
+        narrative_md=narrative,
+        manifest=manifest,
+    )
+
+    type_instructions = {
+        "correction": f"The author wants to correct something: \"{content}\"\nFind the relevant section and fix the factual error.",
+        "injection": f"The author wants to add context: \"{content}\"\nFind where this context belongs and incorporate it naturally.",
+        "needs_detail": f"The author says: \"{content}\"\nFind the section that needs more detail and use search_session to enrich it with evidence from source data.",
+        "add_subsection": f"The author wants a new subsection about: \"{content}\"\nFind the best parent section, search for relevant source data, and write a new subsection.",
+        "tone_change": f"The author wants to change tone to '{tone}' for the section most related to: \"{content}\"",
+    }
+
+    instruction = type_instructions.get(ann_type, f"Apply this annotation: {content}")
+
+    system = (
+        "You are editing a research narrative. The author has given you an instruction "
+        "but did NOT specify which section to apply it to. You must:\n\n"
+        "1. Use list_sections to see all sections\n"
+        "2. Use read_section to read candidate sections\n"
+        "3. Determine the best section to apply the change\n"
+        "4. If the annotation type requires source data (needs_detail, add_subsection), "
+        "use search_session to find evidence\n"
+        "5. Output the COMPLETE updated narrative with the change applied\n\n"
+        "Return the FULL narrative markdown (all sections, not just the changed one)."
+    )
+
+    task = (
+        f"Annotation type: {ann_type}\n"
+        f"Instruction: {instruction}\n\n"
+        f"Current narrative ({len(narrative)} chars) is available via the tools. "
+        "Use list_sections and read_section to explore it. "
+        "Then output the complete updated narrative."
+    )
+
+    result = run_agent(
+        task=task,
+        tools=ALL_TOOLS,
+        tool_handler=tool_handler,
+        model=model,
+        system=system,
+        max_iterations=12,
+    )
+
+    # Agent should return the full narrative; if too short, it probably only returned a section
+    if result and len(result) > len(narrative) * 0.3:
+        return result
+    logger.warning("Auto annotation result too short (%d chars vs %d), skipping", len(result), len(narrative))
+    return None
 
 
 def expand_section(
