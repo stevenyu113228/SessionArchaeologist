@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ChevronLeft, Play, Zap, FileText, AlertCircle, Flame, BookOpen } from 'lucide-react';
+import { ChevronLeft, Play, Zap, AlertCircle, Flame, BookOpen } from 'lucide-react';
 import { api } from '../api/client';
 import type { SessionDetail, Chunk, Turn, TurnsPage, NarrativeListItem, PipelineStatus } from '../api/types';
 
@@ -57,7 +57,6 @@ export default function SessionView() {
 
   const manifest = session.manifest || {};
   const hotZones = manifest.hot_zones || [];
-  const errorDensity = manifest.error_density || [];
   const toolTimeline = manifest.tool_timeline || [];
 
   return (

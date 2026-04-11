@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { X, Download, FileText, Presentation, FileCode, BookOpen } from 'lucide-react';
 
 type Props = {

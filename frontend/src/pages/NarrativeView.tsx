@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import {
-  ChevronLeft, Download, GitCompare, Send, Star, Edit3,
+  ChevronLeft, Download, GitCompare, Star,
   MessageSquarePlus, RefreshCw, Eye, Pen, Search,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -102,17 +102,6 @@ export default function NarrativeView() {
     if (!id || !narrative) return;
     setScore(s);
     await api.narratives.score(id, narrative.revision, s);
-  };
-
-  const handleExport = () => {
-    if (!narrative) return;
-    const blob = new Blob([narrative.content_md], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `narrative-rev${narrative.revision}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   const doSearch = async () => {
