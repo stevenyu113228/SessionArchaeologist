@@ -1,8 +1,15 @@
-"""Pipeline control endpoints — trigger stages, check status."""
+"""Pipeline control endpoints — trigger stages, check status, SSE progress."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+import asyncio
+import json
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session as DBSession
 
@@ -11,6 +18,10 @@ from archaeologist.api.routes.sessions import _find_session
 from archaeologist.config import settings
 
 router = APIRouter()
+
+# In-memory progress tracking for active pipeline stages
+_extraction_progress: dict[str, list[dict]] = {}
+_synthesis_progress: dict[str, list[dict]] = {}
 
 
 class PipelineStatus(BaseModel):
@@ -41,10 +52,6 @@ def get_pipeline_status(session_id: str, db: DBSession = Depends(get_db)):
         extracted_chunks=extracted,
         total_narratives=narr_count,
     )
-
-
-class ChunkRequest(BaseModel):
-    pass
 
 
 @router.post("/sessions/{session_id}/chunk")
@@ -93,10 +100,85 @@ def trigger_chunking(session_id: str, db: DBSession = Depends(get_db)):
     return {"chunks_created": len(chunks)}
 
 
+def _extract_one_chunk(session_id_str: str, chunk_id, chunk_index: int, total_chunks: int,
+                       start_turn: int, end_turn: int, overlap_start_turn, session_id_uuid):
+    """Extract a single chunk in a worker thread (has its own DB session)."""
+    from archaeologist.db.models import Chunk, Turn
+    from archaeologist.db.session import SessionLocal
+    from archaeologist.extractor.agent import extract_chunk
+
+    db = SessionLocal()
+    try:
+        turns = (
+            db.query(Turn)
+            .filter(Turn.session_id == session_id_uuid, Turn.turn_index >= start_turn, Turn.turn_index <= end_turn)
+            .order_by(Turn.turn_index)
+            .all()
+        )
+
+        chunk = db.query(Chunk).filter(Chunk.id == chunk_id).first()
+        if not chunk:
+            return
+
+        chunk.extraction_status = "processing"
+        db.commit()
+
+        # Push progress event
+        _push_progress(session_id_str, {
+            "type": "chunk_start",
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+        })
+
+        t0 = time.time()
+        result = extract_chunk(
+            turns=turns,
+            chunk_id=chunk_index,
+            total_chunks=total_chunks,
+            has_overlap=overlap_start_turn is not None,
+            overlap_tokens=0,
+            model=settings.extraction_model,
+        )
+        elapsed = time.time() - t0
+
+        chunk.extraction_result = result
+        chunk.extraction_status = "done"
+        chunk.extraction_model = settings.extraction_model
+        db.commit()
+
+        _push_progress(session_id_str, {
+            "type": "chunk_done",
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "elapsed_seconds": round(elapsed, 1),
+        })
+    except Exception as e:
+        try:
+            chunk = db.query(Chunk).filter(Chunk.id == chunk_id).first()
+            if chunk:
+                chunk.extraction_status = "failed"
+                db.commit()
+        except Exception:
+            pass
+        _push_progress(session_id_str, {
+            "type": "chunk_error",
+            "chunk_index": chunk_index,
+            "error": str(e),
+        })
+    finally:
+        db.close()
+
+
+def _push_progress(session_id: str, event: dict):
+    if session_id not in _extraction_progress:
+        _extraction_progress[session_id] = []
+    _extraction_progress[session_id].append(event)
+
+
 @router.post("/sessions/{session_id}/extract")
 def trigger_extraction(session_id: str, db: DBSession = Depends(get_db)):
-    from archaeologist.db.models import Chunk, Turn
-    from archaeologist.extractor.agent import extract_chunk
+    """Launch parallel extraction in background threads, return immediately."""
+    from archaeologist.db.models import Chunk
 
     session = _find_session(db, session_id)
     chunks = db.query(Chunk).filter(Chunk.session_id == session.id).order_by(Chunk.chunk_index).all()
@@ -104,43 +186,91 @@ def trigger_extraction(session_id: str, db: DBSession = Depends(get_db)):
     if not chunks:
         raise HTTPException(400, "No chunks. Run chunking first.")
 
-    total_chunks = len(chunks)
-    for c in chunks:
-        if c.extraction_status == "done":
-            continue
-
-        turns = (
-            db.query(Turn)
-            .filter(Turn.session_id == session.id, Turn.turn_index >= c.start_turn, Turn.turn_index <= c.end_turn)
-            .order_by(Turn.turn_index)
-            .all()
-        )
-
-        result = extract_chunk(
-            turns=turns,
-            chunk_id=c.chunk_index,
-            total_chunks=total_chunks,
-            has_overlap=c.overlap_start_turn is not None,
-            overlap_tokens=0,
-            model=settings.extraction_model,
-        )
-
-        c.extraction_result = result
-        c.extraction_status = "done"
-        c.extraction_model = settings.extraction_model
+    pending = [c for c in chunks if c.extraction_status != "done"]
+    if not pending:
+        session.status = "extracted"
         db.commit()
+        return {"status": "already_done", "extracted": len(chunks)}
 
-    session.status = "extracted"
+    total_chunks = len(chunks)
+    sid = str(session.id)
+
+    # Reset progress
+    _extraction_progress[sid] = []
+    _push_progress(sid, {"type": "started", "total_chunks": total_chunks, "pending": len(pending)})
+
+    # Prepare chunk info before leaving this DB session
+    chunk_infos = [
+        (sid, c.id, c.chunk_index, total_chunks, c.start_turn, c.end_turn, c.overlap_start_turn, session.id)
+        for c in pending
+    ]
+
+    session.status = "extracting"
     db.commit()
-    return {"extracted": total_chunks}
+
+    # Launch parallel extraction in background
+    max_workers = min(settings.max_parallel_extractions, len(pending))
+
+    def _run_all():
+        from archaeologist.db.session import SessionLocal
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_extract_one_chunk, *info) for info in chunk_infos]
+            for f in futures:
+                f.result()  # wait for all
+
+        # Mark session as extracted
+        db2 = SessionLocal()
+        try:
+            from archaeologist.db.models import Session
+            s = db2.query(Session).filter(Session.id == chunk_infos[0][7]).first()
+            if s:
+                s.status = "extracted"
+                db2.commit()
+        finally:
+            db2.close()
+
+        _push_progress(sid, {"type": "all_done", "total_chunks": total_chunks})
+
+    thread = threading.Thread(target=_run_all, daemon=True)
+    thread.start()
+
+    return {"status": "started", "total_chunks": total_chunks, "pending": len(pending), "workers": max_workers}
+
+
+@router.get("/sessions/{session_id}/extract/progress")
+async def extraction_progress_sse(session_id: str, request: Request, db: DBSession = Depends(get_db)):
+    """SSE endpoint — streams extraction progress events."""
+    session = _find_session(db, session_id)
+    sid = str(session.id)
+
+    async def event_stream():
+        cursor = 0
+        while True:
+            if await request.is_disconnected():
+                break
+
+            events = _extraction_progress.get(sid, [])
+            while cursor < len(events):
+                evt = events[cursor]
+                yield f"data: {json.dumps(evt)}\n\n"
+                cursor += 1
+                if evt.get("type") == "all_done":
+                    return
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+def _push_synthesis(session_id: str, event: dict):
+    if session_id not in _synthesis_progress:
+        _synthesis_progress[session_id] = []
+    _synthesis_progress[session_id].append(event)
 
 
 @router.post("/sessions/{session_id}/synthesize")
 def trigger_synthesis(session_id: str, db: DBSession = Depends(get_db)):
-    from sqlalchemy import func
-
-    from archaeologist.db.models import Chunk, Narrative
-    from archaeologist.synthesizer.agent import synthesize_narrative
+    from archaeologist.db.models import Chunk
 
     session = _find_session(db, session_id)
     chunks = (
@@ -154,22 +284,76 @@ def trigger_synthesis(session_id: str, db: DBSession = Depends(get_db)):
         raise HTTPException(400, "No extracted chunks. Run extraction first.")
 
     extractions = [c.extraction_result for c in chunks]
-    narrative_md = synthesize_narrative(extractions, model=settings.synthesis_model)
+    session_id_uuid = session.id
+    sid = str(session.id)
 
-    max_rev = db.query(func.max(Narrative.revision)).filter(Narrative.session_id == session.id).scalar()
-    revision = (max_rev or 0) + 1
+    _synthesis_progress[sid] = []
+    _push_synthesis(sid, {"type": "started"})
 
-    narr = Narrative(
-        session_id=session.id,
-        revision=revision,
-        content_md=narrative_md,
-        synthesis_model=settings.synthesis_model,
-    )
-    db.add(narr)
-    session.status = "synthesized"
+    session.status = "synthesizing"
     db.commit()
 
-    return {"revision": revision, "content_length": len(narrative_md)}
+    def _run():
+        from sqlalchemy import func
+        from archaeologist.db.models import Narrative, Session
+        from archaeologist.db.session import SessionLocal
+        from archaeologist.synthesizer.agent import synthesize_narrative
+
+        def on_progress(evt):
+            _push_synthesis(sid, {**evt, "type": "progress"})
+
+        _push_synthesis(sid, {"type": "progress", "step": "calling_llm", "detail": "Calling Opus..."})
+        narrative_md = synthesize_narrative(extractions, model=settings.synthesis_model, on_progress=on_progress)
+
+        db2 = SessionLocal()
+        try:
+            max_rev = db2.query(func.max(Narrative.revision)).filter(Narrative.session_id == session_id_uuid).scalar()
+            revision = (max_rev or 0) + 1
+
+            narr = Narrative(
+                session_id=session_id_uuid,
+                revision=revision,
+                content_md=narrative_md,
+                synthesis_model=settings.synthesis_model,
+            )
+            db2.add(narr)
+            s = db2.query(Session).filter(Session.id == session_id_uuid).first()
+            if s:
+                s.status = "synthesized"
+            db2.commit()
+            _push_synthesis(sid, {"type": "done", "revision": revision, "content_length": len(narrative_md)})
+        finally:
+            db2.close()
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return {"status": "started"}
+
+
+@router.get("/sessions/{session_id}/synthesize/progress")
+async def synthesis_progress_sse(session_id: str, request: Request, db: DBSession = Depends(get_db)):
+    """SSE endpoint — streams synthesis progress events."""
+    session = _find_session(db, session_id)
+    sid = str(session.id)
+
+    async def event_stream():
+        cursor = 0
+        while True:
+            if await request.is_disconnected():
+                break
+
+            events = _synthesis_progress.get(sid, [])
+            while cursor < len(events):
+                evt = events[cursor]
+                yield f"data: {json.dumps(evt)}\n\n"
+                cursor += 1
+                if evt.get("type") == "done":
+                    return
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @router.get("/config")

@@ -93,8 +93,36 @@ export const api = {
     chunk: (sessionId: string) =>
       fetchJson<{ chunks_created: number }>(`/sessions/${sessionId}/chunk`, { method: 'POST' }),
     extract: (sessionId: string) =>
-      fetchJson<{ extracted: number }>(`/sessions/${sessionId}/extract`, { method: 'POST' }),
+      fetchJson<{ status: string; total_chunks: number; pending: number; workers?: number }>(
+        `/sessions/${sessionId}/extract`, { method: 'POST' },
+      ),
+    extractProgress: (sessionId: string, onEvent: (evt: any) => void, onDone: () => void) => {
+      const es = new EventSource(`${BASE}/sessions/${sessionId}/extract/progress`);
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        onEvent(data);
+        if (data.type === 'all_done') {
+          es.close();
+          onDone();
+        }
+      };
+      es.onerror = () => { es.close(); onDone(); };
+      return es;
+    },
     synthesize: (sessionId: string) =>
-      fetchJson<{ revision: number }>(`/sessions/${sessionId}/synthesize`, { method: 'POST' }),
+      fetchJson<{ status: string }>(`/sessions/${sessionId}/synthesize`, { method: 'POST' }),
+    synthesizeProgress: (sessionId: string, onEvent: (evt: any) => void, onDone: () => void) => {
+      const es = new EventSource(`${BASE}/sessions/${sessionId}/synthesize/progress`);
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        onEvent(data);
+        if (data.type === 'done') {
+          es.close();
+          onDone();
+        }
+      };
+      es.onerror = () => { es.close(); onDone(); };
+      return es;
+    },
   },
 };

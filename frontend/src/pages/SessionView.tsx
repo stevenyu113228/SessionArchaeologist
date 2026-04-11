@@ -14,6 +14,8 @@ export default function SessionView() {
   const [turnsOffset, setTurnsOffset] = useState(0);
   const [loading, setLoading] = useState('');
   const [tab, setTab] = useState<'overview' | 'turns' | 'timeline' | 'narratives'>('overview');
+  const [extractProgress, setExtractProgress] = useState<{ done: number; total: number; current: number; elapsed: number[] } | null>(null);
+  const [synthProgress, setSynthProgress] = useState<string | null>(null);
 
   const load = async () => {
     if (!id) return;
@@ -44,12 +46,58 @@ export default function SessionView() {
     if (!id) return;
     setLoading(stage);
     try {
-      if (stage === 'chunk') await api.pipeline.chunk(id);
-      else if (stage === 'extract') await api.pipeline.extract(id);
-      else if (stage === 'synthesize') await api.pipeline.synthesize(id);
-      await load();
+      if (stage === 'chunk') {
+        await api.pipeline.chunk(id);
+        await load();
+      } else if (stage === 'extract') {
+        const res = await api.pipeline.extract(id);
+        if (res.status === 'already_done') {
+          await load();
+          return;
+        }
+        // Start listening for SSE progress
+        setExtractProgress({ done: 0, total: res.total_chunks, current: -1, elapsed: [] });
+        api.pipeline.extractProgress(
+          id,
+          (evt) => {
+            if (evt.type === 'chunk_start') {
+              setExtractProgress(prev => prev ? { ...prev, current: evt.chunk_index } : null);
+            } else if (evt.type === 'chunk_done') {
+              setExtractProgress(prev => prev ? {
+                ...prev,
+                done: prev.done + 1,
+                current: -1,
+                elapsed: [...prev.elapsed, evt.elapsed_seconds],
+              } : null);
+            }
+          },
+          async () => {
+            setExtractProgress(null);
+            setLoading('');
+            await load();
+          },
+        );
+        return; // don't clear loading here — SSE onDone will
+      } else if (stage === 'synthesize') {
+        await api.pipeline.synthesize(id);
+        setSynthProgress('Calling Opus...');
+        api.pipeline.synthesizeProgress(
+          id,
+          (evt) => {
+            if (evt.type === 'progress') {
+              setSynthProgress(evt.detail || evt.step || 'Processing...');
+            }
+          },
+          async () => {
+            setSynthProgress(null);
+            setLoading('');
+            await load();
+          },
+        );
+        return;
+      }
     } finally {
-      setLoading('');
+      if (stage !== 'extract' && stage !== 'synthesize') setLoading('');
     }
   };
 
@@ -80,22 +128,42 @@ export default function SessionView() {
         <div className="flex gap-2">
           {[
             { stage: 'chunk' as const, label: 'Chunk', enabled: session.status === 'imported' },
-            { stage: 'extract' as const, label: 'Extract', enabled: session.status === 'chunked' },
-            { stage: 'synthesize' as const, label: 'Synthesize', enabled: session.status === 'extracted' },
-          ].map(({ stage, label, enabled }) => (
-            <button
-              key={stage}
-              onClick={() => runStage(stage)}
-              disabled={!enabled || loading !== ''}
-              className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
-                enabled
-                  ? 'bg-[var(--accent-green)]/20 text-[var(--accent-green)] hover:bg-[var(--accent-green)]/30 border border-[var(--accent-green)]/30'
-                  : 'bg-[var(--bg-tertiary)] text-[var(--text-muted)] cursor-not-allowed border border-[var(--border)]'
-              }`}
-            >
-              {loading === stage ? `Running ${label}...` : label}
-            </button>
-          ))}
+            { stage: 'extract' as const, label: 'Extract', enabled: session.status === 'chunked' || session.status === 'extracting' },
+            { stage: 'synthesize' as const, label: 'Synthesize', enabled: session.status === 'extracted' || session.status === 'synthesizing' },
+          ].map(({ stage, label, enabled }) => {
+            let btnLabel = label;
+            if (loading === stage) {
+              if (stage === 'extract' && extractProgress) {
+                const { done, total, current } = extractProgress;
+                const avg = extractProgress.elapsed.length > 0
+                  ? extractProgress.elapsed.reduce((a, b) => a + b, 0) / extractProgress.elapsed.length
+                  : 0;
+                const remaining = total - done;
+                const eta = avg > 0 ? Math.round(remaining * avg) : 0;
+                btnLabel = current >= 0
+                  ? `Extracting chunk ${current + 1}/${total}...`
+                  : `${done}/${total} done${eta > 0 ? ` (~${eta}s left)` : ''}`;
+              } else if (stage === 'synthesize' && synthProgress) {
+                btnLabel = synthProgress;
+              } else {
+                btnLabel = `Running ${label}...`;
+              }
+            }
+            return (
+              <button
+                key={stage}
+                onClick={() => runStage(stage)}
+                disabled={!enabled || loading !== ''}
+                className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
+                  enabled
+                    ? 'bg-[var(--accent-green)]/20 text-[var(--accent-green)] hover:bg-[var(--accent-green)]/30 border border-[var(--accent-green)]/30'
+                    : 'bg-[var(--bg-tertiary)] text-[var(--text-muted)] cursor-not-allowed border border-[var(--border)]'
+                }`}
+              >
+                {btnLabel}
+              </button>
+            );
+          })}
           <div className="ml-auto flex items-center gap-2 text-sm">
             <span className="text-[var(--text-secondary)]">Status:</span>
             <span className="text-[var(--accent-blue)] font-medium">{session.status}</span>
