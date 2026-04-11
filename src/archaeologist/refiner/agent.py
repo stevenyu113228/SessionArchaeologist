@@ -105,7 +105,11 @@ def _apply_auto(
     manifest: dict | None = None,
     model: str = "",
 ) -> str | None:
-    """Auto mode: agent reads the narrative, decides where to apply the annotation, and returns the updated full narrative."""
+    """Auto mode: agent finds the right section, applies the change, returns only the modified section.
+
+    The agent outputs JSON: {"section_heading": "...", "updated_section": "..."}
+    Then we replace that section in the narrative programmatically.
+    """
     tool_handler = create_tool_handler(
         session_id=session_id,
         narrative_md=narrative,
@@ -116,30 +120,31 @@ def _apply_auto(
         "correction": f"The author wants to correct something: \"{content}\"\nFind the relevant section and fix the factual error.",
         "injection": f"The author wants to add context: \"{content}\"\nFind where this context belongs and incorporate it naturally.",
         "needs_detail": f"The author says: \"{content}\"\nFind the section that needs more detail and use search_session to enrich it with evidence from source data.",
-        "add_subsection": f"The author wants a new subsection about: \"{content}\"\nFind the best parent section, search for relevant source data, and write a new subsection.",
+        "add_subsection": f"The author wants a new subsection about: \"{content}\"\nFind the best parent section, search for relevant source data, and write a new subsection to append at the end of that section.",
         "tone_change": f"The author wants to change tone to '{tone}' for the section most related to: \"{content}\"",
     }
 
     instruction = type_instructions.get(ann_type, f"Apply this annotation: {content}")
 
     system = (
-        "You are editing a research narrative. The author has given you an instruction "
-        "but did NOT specify which section to apply it to. You must:\n\n"
+        "You are editing a research narrative. The author gave an instruction "
+        "but did NOT specify which section. Your job:\n\n"
         "1. Use list_sections to see all sections\n"
-        "2. Use read_section to read candidate sections\n"
-        "3. Determine the best section to apply the change\n"
-        "4. If the annotation type requires source data (needs_detail, add_subsection), "
+        "2. Use read_section to read the most relevant section(s)\n"
+        "3. If the task needs source data (needs_detail, add_subsection, injection), "
         "use search_session to find evidence\n"
-        "5. Output the COMPLETE updated narrative with the change applied\n\n"
-        "Return the FULL narrative markdown (all sections, not just the changed one)."
+        "4. Determine the BEST section to modify\n"
+        "5. Apply the change to ONLY that section\n\n"
+        "Your final output must be ONLY the updated section content "
+        "(starting with the ## or ### heading line). "
+        "Do NOT output the entire narrative — just the one modified section."
     )
 
     task = (
         f"Annotation type: {ann_type}\n"
         f"Instruction: {instruction}\n\n"
-        f"Current narrative ({len(narrative)} chars) is available via the tools. "
-        "Use list_sections and read_section to explore it. "
-        "Then output the complete updated narrative."
+        f"The narrative is available via list_sections and read_section tools. "
+        "Find the right section, apply the change, and output ONLY the modified section."
     )
 
     result = run_agent(
@@ -151,11 +156,33 @@ def _apply_auto(
         max_iterations=50,
     )
 
-    # Agent should return the full narrative; if too short, it probably only returned a section
-    if result and len(result) > len(narrative) * 0.3:
-        return result
-    logger.warning("Auto annotation result too short (%d chars vs %d), skipping", len(result), len(narrative))
-    return None
+    if not result or len(result.strip()) < 20:
+        logger.warning("Auto annotation returned empty/tiny result, skipping")
+        return None
+
+    # Find which section the agent modified by matching the heading
+    import re
+    heading_match = re.match(r"^(#{2,6})\s+(.+)", result.strip())
+    if heading_match:
+        heading_text = heading_match.group(2).strip()
+        # Find this heading in the original narrative and replace the section
+        section_slug = heading_text.lower().replace(" ", "_")[:40]
+        original_section = _find_section(narrative, section_slug)
+        if original_section:
+            return narrative.replace(original_section, result.strip(), 1)
+
+        # Fallback: try matching by first few words
+        for line_idx, line in enumerate(narrative.split("\n")):
+            lm = re.match(r"^#{2,6}\s+(.+)", line)
+            if lm and heading_text[:20].lower() in lm.group(1).strip().lower():
+                old_section = _find_section(narrative, lm.group(1).strip().lower()[:40].replace(" ", "_"))
+                if old_section:
+                    return narrative.replace(old_section, result.strip(), 1)
+
+    # Last fallback: if agent didn't start with a heading, try to find the best match
+    # by looking at what section the content is most related to
+    logger.warning("Auto mode: could not identify target section from agent output, appending as new section")
+    return narrative.rstrip() + "\n\n" + result.strip()
 
 
 def expand_section(
