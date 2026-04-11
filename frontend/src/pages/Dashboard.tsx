@@ -55,6 +55,7 @@ export default function Dashboard() {
             type="text"
             value={importPath}
             onChange={e => setImportPath(e.target.value)}
+            onInput={e => setImportPath((e.target as HTMLInputElement).value)}
             onKeyDown={e => e.key === 'Enter' && handleImport()}
             placeholder="Path to .jsonl file or Claude Code project directory"
             className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-blue)]"
