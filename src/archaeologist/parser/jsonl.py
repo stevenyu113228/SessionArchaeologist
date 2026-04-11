@@ -230,7 +230,7 @@ def _detect_error(record: dict, content_text: str, is_tool_result: bool) -> bool
 
     # toolUseResult with stderr
     tool_result = record.get("toolUseResult", {})
-    if tool_result.get("stderr"):
+    if isinstance(tool_result, dict) and tool_result.get("stderr"):
         return True
 
     # Pattern matching on content for tool results
