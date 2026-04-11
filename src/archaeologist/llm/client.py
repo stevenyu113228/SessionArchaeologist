@@ -105,6 +105,9 @@ def chat_completion_json(
 
     # Strip markdown code fences if present
     text = text.strip()
+    if not text:
+        logger.warning("Empty LLM response for JSON request, returning empty dict")
+        return {}
     if text.startswith("```"):
         # Remove first line (```json or ```)
         lines = text.split("\n")
@@ -113,7 +116,20 @@ def chat_completion_json(
             text = text[:-3]
         text = text.strip()
 
-    return json.loads(text)
+    # Try to find JSON in the response if it's wrapped in text
+    if not text.startswith("{") and not text.startswith("["):
+        # Look for first { or [
+        for i, ch in enumerate(text):
+            if ch in "{[":
+                text = text[i:]
+                break
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse JSON response (%d chars): %s...", len(text), text[:200])
+        # Return a minimal valid extraction result
+        return {"error": "JSON parse failed", "raw_text": text[:2000]}
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30))

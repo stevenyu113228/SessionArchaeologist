@@ -469,10 +469,10 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
             def extract_one(chunk_info):
                 cid, cidx, start, end, overlap = chunk_info
                 from archaeologist.db.session import SessionLocal as SL2
+                import traceback as _tb
                 db3 = SL2()
                 try:
                     chunk_turns = turn_dicts[start:end + 1]
-                    # Build pseudo-Turn objects for extractor
                     _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "running"})
                     t0 = time.time()
                     result = extract_chunk(
@@ -488,6 +488,10 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
                         c.extraction_model = settings.extraction_model
                         db3.commit()
                     _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "done", "elapsed": round(elapsed, 1)})
+                except Exception as e:
+                    print(f"EXTRACT ERROR chunk {cidx}: {e}")
+                    _tb.print_exc()
+                    _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "error", "error": str(e)})
                 finally:
                     db3.close()
 
