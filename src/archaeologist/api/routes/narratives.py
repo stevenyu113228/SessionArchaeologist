@@ -159,7 +159,6 @@ def refine_narrative(
         )
         db.add(ann)
 
-    session.status = "refining"
     db.commit()
 
     return {"revision": new_revision, "content_length": len(new_md)}
