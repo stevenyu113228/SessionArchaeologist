@@ -27,7 +27,13 @@ TURN_TYPES = {"user", "assistant", "system"}
 
 
 def parse_jsonl_file(path: Path) -> tuple[list[dict], dict]:
-    """Parse a JSONL file into a list of turn dicts + session manifest.
+    """Parse a JSONL file from disk."""
+    with open(path, "rb") as f:
+        return parse_jsonl_bytes(f.read(), source_path=str(path))
+
+
+def parse_jsonl_bytes(data: bytes, source_path: str = "upload") -> tuple[list[dict], dict]:
+    """Parse JSONL bytes into a list of turn dicts + session manifest.
 
     Returns:
         (turns, manifest) where turns is a list of extracted turn dicts
@@ -40,25 +46,24 @@ def parse_jsonl_file(path: Path) -> tuple[list[dict], dict]:
     session_slug: str | None = None
     version: str | None = None
 
-    with open(path, "rb") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = orjson.loads(line)
-            except orjson.JSONDecodeError:
-                logger.warning("Unparseable line %d in %s", line_num, path)
-                parse_errors += 1
-                continue
-            raw_lines.append(record)
+    for line_num, line in enumerate(data.split(b"\n"), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = orjson.loads(line)
+        except orjson.JSONDecodeError:
+            logger.warning("Unparseable line %d in %s", line_num, source_path)
+            parse_errors += 1
+            continue
+        raw_lines.append(record)
 
-            if not session_id_found and record.get("sessionId"):
-                session_id_found = record["sessionId"]
-            if not session_slug and record.get("slug"):
-                session_slug = record["slug"]
-            if not version and record.get("version"):
-                version = record["version"]
+        if not session_id_found and record.get("sessionId"):
+            session_id_found = record["sessionId"]
+        if not session_slug and record.get("slug"):
+            session_slug = record["slug"]
+        if not version and record.get("version"):
+            version = record["version"]
 
     # Filter to conversation turns only
     turn_index = 0
@@ -77,7 +82,7 @@ def parse_jsonl_file(path: Path) -> tuple[list[dict], dict]:
         session_id=session_id_found,
         session_slug=session_slug,
         version=version,
-        source_path=str(path),
+        source_path=source_path,
         parse_errors=parse_errors,
         total_raw_lines=len(raw_lines),
     )

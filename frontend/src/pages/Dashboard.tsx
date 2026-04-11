@@ -1,33 +1,57 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
-import { Upload, Database, Clock, AlertTriangle } from 'lucide-react';
+import { Upload, Database, Clock, AlertTriangle, FileUp } from 'lucide-react';
 import { api } from '../api/client';
 import type { SessionListItem } from '../api/types';
 
 export default function Dashboard() {
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
-  const [importPath, setImportPath] = useState('');
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState('');
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api.sessions.list().then(setSessions).catch(e => setError(e.message));
   }, []);
 
-  const handleImport = async () => {
-    if (!importPath.trim()) return;
+  const uploadFile = useCallback(async (file: File) => {
+    if (!file.name.endsWith('.jsonl')) {
+      setError('Please upload a .jsonl file');
+      return;
+    }
     setImporting(true);
     setError('');
     try {
-      await api.sessions.import(importPath.trim());
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const res = await fetch('/api/sessions/upload', { method: 'POST', body: formData });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`${res.status}: ${body}`);
+      }
+
       const updated = await api.sessions.list();
       setSessions(updated);
-      setImportPath('');
     } catch (e: any) {
       setError(e.message);
     } finally {
       setImporting(false);
     }
+  }, []);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) uploadFile(file);
+    e.target.value = '';
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) uploadFile(file);
   };
 
   const totalTurns = sessions.reduce((s, x) => s + x.total_turns, 0);
@@ -44,30 +68,44 @@ export default function Dashboard() {
         <StatCard icon={<AlertTriangle size={18} />} label="Total Tokens" value={totalTokens.toLocaleString()} />
       </div>
 
-      {/* Import */}
+      {/* Upload */}
       <div className="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 mb-8">
         <h2 className="text-sm font-semibold mb-3 flex items-center gap-2">
           <Upload size={16} />
           Import Session
         </h2>
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={importPath}
-            onChange={e => setImportPath(e.target.value)}
-            onInput={e => setImportPath((e.target as HTMLInputElement).value)}
-            onKeyDown={e => e.key === 'Enter' && handleImport()}
-            placeholder="Path to .jsonl file or Claude Code project directory"
-            className="flex-1 px-3 py-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-blue)]"
-          />
-          <button
-            onClick={handleImport}
-            disabled={importing}
-            className="px-4 py-2 bg-[var(--accent-blue)] text-black font-medium rounded text-sm hover:opacity-90 disabled:opacity-50"
-          >
-            {importing ? 'Importing...' : 'Import'}
-          </button>
+        <div
+          onClick={() => !importing && fileInputRef.current?.click()}
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={handleDrop}
+          className={`border-2 border-dashed rounded-lg p-8 flex flex-col items-center gap-3 cursor-pointer transition-colors ${
+            dragOver
+              ? 'border-[var(--accent-blue)] bg-[var(--accent-blue)]/10'
+              : 'border-[var(--border)] hover:border-[var(--text-muted)]'
+          } ${importing ? 'opacity-50 pointer-events-none' : ''}`}
+        >
+          <FileUp size={32} className="text-[var(--text-muted)]" />
+          {importing ? (
+            <p className="text-sm text-[var(--text-secondary)]">Importing...</p>
+          ) : (
+            <>
+              <p className="text-sm text-[var(--text-secondary)]">
+                Drop a <span className="mono text-[var(--text-primary)]">.jsonl</span> file here, or click to browse
+              </p>
+              <p className="text-xs text-[var(--text-muted)]">
+                Claude Code session files from ~/.claude/projects/
+              </p>
+            </>
+          )}
         </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".jsonl"
+          onChange={handleFileSelect}
+          className="hidden"
+        />
         {error && <p className="text-[var(--accent-red)] text-xs mt-2">{error}</p>}
       </div>
 
@@ -104,7 +142,7 @@ export default function Dashboard() {
             {sessions.length === 0 && (
               <tr>
                 <td colSpan={5} className="px-4 py-8 text-center text-[var(--text-muted)]">
-                  No sessions yet. Import a JSONL file to get started.
+                  No sessions yet. Upload a .jsonl file to get started.
                 </td>
               </tr>
             )}

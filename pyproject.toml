@@ -21,6 +21,8 @@ dependencies = [
     "rich>=13.9",
     # Config
     "pydantic-settings>=2.7",
+    # Multipart upload
+    "python-multipart>=0.0.18",
     # JSON parsing
     "orjson>=3.10",
     # YAML (for feedback files)

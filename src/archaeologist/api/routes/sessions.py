@@ -127,6 +127,64 @@ def import_session(req: ImportRequest, db: DBSession = Depends(get_db)):
     return {"id": str(session.id), "name": session_name, "total_turns": manifest["total_turns"]}
 
 
+@router.post("/upload")
+async def upload_session(
+    file: UploadFile = File(...),
+    name: Optional[str] = Query(None),
+    db: DBSession = Depends(get_db),
+):
+    """Upload a .jsonl file to import a session."""
+    from archaeologist.parser.jsonl import parse_jsonl_bytes
+
+    if not file.filename or not file.filename.endswith(".jsonl"):
+        raise HTTPException(400, "File must be a .jsonl file")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+
+    turns_data, manifest = parse_jsonl_bytes(data, source_path=file.filename)
+    session_name = name or manifest.get("session_slug") or file.filename.rsplit(".", 1)[0]
+
+    from archaeologist.db.models import Turn
+
+    session = Session(
+        name=session_name,
+        source_path=f"upload:{file.filename}",
+        total_turns=manifest["total_turns"],
+        total_tokens_est=manifest["total_tokens_est"],
+        manifest=manifest,
+        status="imported",
+    )
+    db.add(session)
+    db.flush()
+
+    for td in turns_data:
+        turn = Turn(
+            session_id=session.id,
+            turn_index=td["turn_index"],
+            role=td["role"],
+            content_text=td["content_text"],
+            tool_calls=td["tool_calls"],
+            is_compact_boundary=td["is_compact_boundary"],
+            is_error=td["is_error"],
+            token_estimate=td["token_estimate"],
+            content_hash=td["content_hash"],
+            timestamp=td["timestamp"],
+            raw_jsonl_line=td["raw_jsonl_line"],
+            message_uuid=td["message_uuid"],
+            parent_uuid=td["parent_uuid"],
+            is_sidechain=td["is_sidechain"],
+            model_used=td["model_used"],
+            token_usage=td["token_usage"],
+            has_thinking=td["has_thinking"],
+        )
+        db.add(turn)
+
+    db.commit()
+    return {"id": str(session.id), "name": session_name, "total_turns": manifest["total_turns"]}
+
+
 @router.delete("/{session_id}")
 def delete_session(session_id: str, db: DBSession = Depends(get_db)):
     session = _find_session(db, session_id)
