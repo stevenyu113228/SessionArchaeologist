@@ -389,12 +389,23 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
     _push_pipeline(sid, {"type": "started"})
 
     def _run():
+        import sys, traceback as _tb
+        print(f"[PIPELINE] _run() started for {sid}, subagents={len(subagent_ids)}", flush=True)
+        try:
+            _run_inner()
+        except Exception as e:
+            print(f"[PIPELINE] FATAL: {e}", flush=True)
+            _tb.print_exc()
+            sys.stderr.flush()
+            _push_pipeline(sid, {"type": "error", "message": str(e)})
+
+    def _run_inner():
         from archaeologist.db.session import SessionLocal
         from archaeologist.db.models import Chunk, Turn, Narrative, Session as SM
         from archaeologist.chunker.engine import chunk_session
         from archaeologist.extractor.agent import extract_chunk
         from archaeologist.synthesizer.agent import synthesize_narrative
-        from sqlalchemy import func
+        from sqlalchemy import func, text as sql_text
         from concurrent.futures import ThreadPoolExecutor
         import time
 
@@ -404,38 +415,41 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
 
             # --- Stage 1: Chunk ---
             _push_pipeline(sid, {"type": "stage", "stage": "chunk", "status": "running"})
+            print(f"[PIPELINE] Loading turns for chunking...", flush=True)
 
-            # Gather turns — main + subagent if applicable
-            turns = list(db2.query(Turn).filter(Turn.session_id == session_uuid).order_by(Turn.turn_index).all())
+            # Load only lightweight fields for chunking (no content_text to avoid OOM on large sessions)
+            # Only chunk the MAIN session — subagent content is included via their own sessions
+            from sqlalchemy import text as sql_text
+            print(f"[PIPELINE] Loading turns for chunking...", flush=True)
 
-            if subagent_ids:
-                import uuid as _uuid
-                for sa_id in subagent_ids:
-                    sa_turns = db2.query(Turn).filter(
-                        Turn.session_id == _uuid.UUID(sa_id)
-                    ).order_by(Turn.turn_index).all()
-                    turns.extend(sa_turns)
-                # Re-sort by timestamp for chronological merge
-                turns.sort(key=lambda t: t.timestamp or datetime(2000, 1, 1))
-                # Re-index
-                for i, t_obj in enumerate(turns):
-                    pass  # keep original turn_index for DB reference
+            turn_meta = db2.execute(sql_text("""
+                SELECT turn_index, token_estimate, timestamp, role,
+                       is_compact_boundary, is_error
+                FROM turns WHERE session_id = :sid
+                ORDER BY turn_index
+            """), {"sid": str(session_uuid)}).fetchall()
+
+            print(f"[PIPELINE] Loaded {len(turn_meta)} turn metadata", flush=True)
 
             turn_dicts = [
                 {
-                    "turn_index": i,
-                    "token_estimate": t.token_estimate,
-                    "timestamp": t.timestamp,
-                    "role": t.role,
-                    "is_compact_boundary": t.is_compact_boundary,
-                    "is_error": t.is_error,
-                    "tool_calls": t.tool_calls,
-                    "content_text": t.content_text,
+                    "turn_index": r[0],
+                    "token_estimate": r[1] or 0,
+                    "timestamp": r[2],
+                    "role": r[3] or "user",
+                    "is_compact_boundary": bool(r[4]),
+                    "is_error": bool(r[5]),
+                    "tool_calls": None,
+                    "content_text": "",
                 }
-                for i, t in enumerate(turns)
+                for r in turn_meta
             ]
 
-            chunks_data = chunk_session(turn_dicts, session.manifest or {})
+            # Use empty manifest for merged sessions — original hot_zones don't match re-indexed turns
+            chunk_manifest = {} if subagent_ids else (session.manifest or {})
+            print(f"[PIPELINE] Chunking {len(turn_dicts)} turns...", flush=True)
+            chunks_data = chunk_session(turn_dicts, chunk_manifest)
+            print(f"[PIPELINE] Chunking done: {len(chunks_data)} chunks", flush=True)
 
             db2.query(Chunk).filter(Chunk.session_id == session_uuid).delete()
             chunk_records = []
@@ -472,7 +486,28 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
                 import traceback as _tb
                 db3 = SL2()
                 try:
-                    chunk_turns = turn_dicts[start:end + 1]
+                    # Load content for this chunk's turn range from DB
+                    chunk_turn_rows = db3.execute(sql_text("""
+                        SELECT turn_index, token_estimate, timestamp, role,
+                               is_compact_boundary, is_error, tool_calls, content_text
+                        FROM turns WHERE session_id = :sid
+                          AND turn_index >= :start AND turn_index <= :end
+                        ORDER BY turn_index
+                    """), {"sid": str(session_uuid), "start": start, "end": end}).fetchall()
+
+                    chunk_turns = [
+                        {
+                            "turn_index": r[0],
+                            "token_estimate": r[1] or 0,
+                            "timestamp": r[2],
+                            "role": r[3] or "user",
+                            "is_compact_boundary": bool(r[4]),
+                            "is_error": bool(r[5]),
+                            "tool_calls": r[6],
+                            "content_text": (r[7] or "").replace("\x00", ""),
+                        }
+                        for r in chunk_turn_rows
+                    ]
                     _push_pipeline(sid, {"type": "extract_chunk", "chunk": cidx + 1, "total": total_chunks, "status": "running"})
                     t0 = time.time()
                     result = extract_chunk(
@@ -540,6 +575,9 @@ def run_pipeline(session_id: str, db: DBSession = Depends(get_db)):
 
             _push_pipeline(sid, {"type": "pipeline_done"})
         except Exception as e:
+            import traceback, sys
+            traceback.print_exc()
+            sys.stderr.flush()
             _push_pipeline(sid, {"type": "error", "message": str(e)})
         finally:
             db2.close()
