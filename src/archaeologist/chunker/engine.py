@@ -71,7 +71,8 @@ def chunk_session(turns: list[dict], manifest: dict) -> list[dict]:
 
         # Next chunk starts at split_idx + 1, minus overlap
         overlap_start = _compute_overlap_start(turns, split_idx, overlap)
-        chunk_start = overlap_start
+        # CRITICAL: ensure forward progress — never go back to or before current start
+        chunk_start = max(overlap_start, chunk_start + 1)
         chunk_index += 1
 
     logger.info("Created %d chunks from %d turns", len(chunks), len(turns))
