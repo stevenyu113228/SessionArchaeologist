@@ -31,8 +31,12 @@ TURN_TYPES = {"user", "assistant", "system"}
 def parse_project_zip(data: bytes) -> dict:
     """Parse a zip containing a Claude Code project directory.
 
+    Supports two structures:
+    1. Single session: one main .jsonl + optional subagents/
+    2. Multi-session project: multiple .jsonl files (one project dir with several sessions)
+
     Expected structure inside the zip:
-      *.jsonl                         — main session file (largest)
+      *.jsonl                         — session files (largest = main, rest = additional)
       {session-id}/subagents/agent-*.jsonl  — subagent sessions
       {session-id}/subagents/agent-*.meta.json — subagent metadata
       {session-id}/tool-results/*.txt — large tool output cache (optional)
@@ -40,6 +44,10 @@ def parse_project_zip(data: bytes) -> dict:
     Returns:
       {
         "main": {"turns": [...], "manifest": {...}},
+        "additional_sessions": [
+          {"turns": [...], "manifest": {...}, "filename": "..."},
+          ...
+        ],
         "subagents": [
           {"turns": [...], "manifest": {...}, "agent_id": "...",
            "agent_type": "Explore", "description": "..."},
@@ -53,17 +61,32 @@ def parse_project_zip(data: bytes) -> dict:
     # Find all JSONL files
     jsonl_files = [n for n in names if n.endswith(".jsonl")]
 
-    # Separate main session from subagent files
+    # Separate: subagent files vs root-level session files
     subagent_files = [n for n in jsonl_files if "/subagents/" in n]
-    main_candidates = [n for n in jsonl_files if n not in subagent_files]
+    session_files = [n for n in jsonl_files if n not in subagent_files]
 
-    if not main_candidates:
-        raise ValueError("No main session .jsonl found in zip")
+    if not session_files:
+        raise ValueError("No session .jsonl files found in zip")
 
-    # Pick largest JSONL as main session
-    main_file = max(main_candidates, key=lambda n: zf.getinfo(n).file_size)
+    # Sort by file size descending — largest is the main session
+    session_files.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+
+    # Main session = largest file
+    main_file = session_files[0]
     main_data = zf.read(main_file)
     main_turns, main_manifest = parse_jsonl_bytes(main_data, source_path=main_file)
+
+    # Additional sessions (other root-level JSONL files)
+    additional_sessions = []
+    for sf in session_files[1:]:
+        sf_data = zf.read(sf)
+        sf_turns, sf_manifest = parse_jsonl_bytes(sf_data, source_path=sf)
+        if sf_manifest["total_turns"] > 0:
+            additional_sessions.append({
+                "turns": sf_turns,
+                "manifest": sf_manifest,
+                "filename": PurePosixPath(sf).stem,
+            })
 
     # Parse subagents
     subagents = []
@@ -95,7 +118,11 @@ def parse_project_zip(data: bytes) -> dict:
             "description": description,
         })
 
-    return {"main": {"turns": main_turns, "manifest": main_manifest}, "subagents": subagents}
+    return {
+        "main": {"turns": main_turns, "manifest": main_manifest},
+        "additional_sessions": additional_sessions,
+        "subagents": subagents,
+    }
 
 
 def parse_jsonl_file(path: Path) -> tuple[list[dict], dict]:
@@ -123,6 +150,8 @@ def parse_jsonl_bytes(data: bytes, source_path: str = "upload") -> tuple[list[di
         if not line:
             continue
         try:
+            # Strip NUL bytes that break PostgreSQL TEXT/JSONB columns
+            line = line.replace(b"\x00", b"")
             record = orjson.loads(line)
         except orjson.JSONDecodeError:
             logger.warning("Unparseable line %d in %s", line_num, source_path)
@@ -200,7 +229,7 @@ def _extract_turn(record: dict, turn_index: int) -> dict | None:
     return {
         "turn_index": turn_index,
         "role": role,
-        "content_text": content_text,
+        "content_text": content_text.replace("\x00", "") if content_text else "",
         "tool_calls": tool_calls if tool_calls else None,
         "is_compact_boundary": is_compact,
         "is_error": is_error,

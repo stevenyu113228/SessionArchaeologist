@@ -136,27 +136,7 @@ def import_session(req: ImportRequest, db: DBSession = Depends(get_db)):
     db.add(session)
     db.flush()
 
-    for td in turns_data:
-        turn = Turn(
-            session_id=session.id,
-            turn_index=td["turn_index"],
-            role=td["role"],
-            content_text=td["content_text"],
-            tool_calls=td["tool_calls"],
-            is_compact_boundary=td["is_compact_boundary"],
-            is_error=td["is_error"],
-            token_estimate=td["token_estimate"],
-            content_hash=td["content_hash"],
-            timestamp=td["timestamp"],
-            raw_jsonl_line=td["raw_jsonl_line"],
-            message_uuid=td["message_uuid"],
-            parent_uuid=td["parent_uuid"],
-            is_sidechain=td["is_sidechain"],
-            model_used=td["model_used"],
-            token_usage=td["token_usage"],
-            has_thinking=td["has_thinking"],
-        )
-        db.add(turn)
+    _store_turns(db, session.id, turns_data)
 
     db.commit()
     return {"id": str(session.id), "name": session_name, "total_turns": manifest["total_turns"]}
@@ -194,30 +174,21 @@ async def upload_session(
     db.add(session)
     db.flush()
 
-    for td in turns_data:
-        turn = Turn(
-            session_id=session.id,
-            turn_index=td["turn_index"],
-            role=td["role"],
-            content_text=td["content_text"],
-            tool_calls=td["tool_calls"],
-            is_compact_boundary=td["is_compact_boundary"],
-            is_error=td["is_error"],
-            token_estimate=td["token_estimate"],
-            content_hash=td["content_hash"],
-            timestamp=td["timestamp"],
-            raw_jsonl_line=td["raw_jsonl_line"],
-            message_uuid=td["message_uuid"],
-            parent_uuid=td["parent_uuid"],
-            is_sidechain=td["is_sidechain"],
-            model_used=td["model_used"],
-            token_usage=td["token_usage"],
-            has_thinking=td["has_thinking"],
-        )
-        db.add(turn)
+    _store_turns(db, session.id, turns_data)
 
     db.commit()
     return {"id": str(session.id), "name": session_name, "total_turns": manifest["total_turns"]}
+
+
+def _sanitize_nul(obj):
+    """Recursively strip NUL chars from strings in dicts/lists (PostgreSQL rejects them)."""
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {k: _sanitize_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nul(v) for v in obj]
+    return obj
 
 
 def _store_turns(db: DBSession, session_id, turns_data: list[dict]):
@@ -227,13 +198,14 @@ def _store_turns(db: DBSession, session_id, turns_data: list[dict]):
         db.add(Turn(
             session_id=session_id,
             turn_index=td["turn_index"], role=td["role"],
-            content_text=td["content_text"], tool_calls=td["tool_calls"],
+            content_text=(td["content_text"] or "").replace("\x00", ""),
+            tool_calls=_sanitize_nul(td["tool_calls"]),
             is_compact_boundary=td["is_compact_boundary"], is_error=td["is_error"],
             token_estimate=td["token_estimate"], content_hash=td["content_hash"],
-            timestamp=td["timestamp"], raw_jsonl_line=td["raw_jsonl_line"],
+            timestamp=td["timestamp"], raw_jsonl_line=_sanitize_nul(td["raw_jsonl_line"]),
             message_uuid=td["message_uuid"], parent_uuid=td["parent_uuid"],
             is_sidechain=td["is_sidechain"], model_used=td["model_used"],
-            token_usage=td["token_usage"], has_thinking=td["has_thinking"],
+            token_usage=_sanitize_nul(td["token_usage"]), has_thinking=td["has_thinking"],
         ))
 
 
@@ -271,6 +243,33 @@ async def upload_project(
     db.flush()
     _store_turns(db, parent.id, main["turns"])
 
+    # Store additional sessions (other JSONL files in the project)
+    additional_results = []
+    for extra in project.get("additional_sessions", []):
+        ex_manifest = extra["manifest"]
+        ex_name = ex_manifest.get("session_slug") or extra["filename"][:40]
+        child = Session(
+            name=ex_name,
+            source_path=f"session:{extra['filename']}",
+            total_turns=ex_manifest["total_turns"],
+            total_tokens_est=ex_manifest["total_tokens_est"],
+            manifest=ex_manifest,
+            status="imported",
+            parent_session_id=parent.id,
+            session_type="subagent",
+            agent_type="session",
+            agent_description=f"Additional session: {ex_name}",
+        )
+        db.add(child)
+        db.flush()
+        _store_turns(db, child.id, extra["turns"])
+        additional_results.append({
+            "id": str(child.id), "name": ex_name,
+            "agent_type": "session", "description": f"Additional session ({ex_manifest['total_turns']} turns)",
+            "total_turns": ex_manifest["total_turns"],
+        })
+
+    # Store subagents
     subagent_results = []
     for sa in project["subagents"]:
         sa_manifest = sa["manifest"]
@@ -299,7 +298,9 @@ async def upload_project(
     db.commit()
     return {
         "id": str(parent.id), "name": session_name,
-        "total_turns": main_manifest["total_turns"], "subagents": subagent_results,
+        "total_turns": main_manifest["total_turns"],
+        "additional_sessions": additional_results,
+        "subagents": subagent_results,
     }
 
 
